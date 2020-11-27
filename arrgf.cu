@@ -60,25 +60,25 @@ std::string get_ker_name(int ker)
 			return "none";
 			break;
 		case KER_GAUSSIAN:
-			return std::string("Gaussian");
+			return std::string("gaussian");
 			break;
 		case KER_TUKEY:
-			return std::string("Tukey");
+			return std::string("tukey");
 			break;
 		case KER_BOX:
-			return std::string("Box");
+			return std::string("box");
 			break;
 		case KER_LORENTZ:
-			return std::string("Lorentz");
+			return std::string("lorentz");
 			break;
 		case KER_HSINC:
-			return std::string("Hamming Sinc") ;
+			return std::string("hsinc") ;
 			break;
 		case KER_SINC:
 			return std::string("sinc") ;
 			break;
 		case KER_DELTA:
-			return std::string("Delta");
+			return std::string("delta");
 			break;
 		default:
 			return std::string("none");
@@ -96,19 +96,19 @@ std::string get_lm_name(int lm)
 	switch(lm)
 	{
 		case LM_NONE:
-			return "None";
+			return "none";
 			break;
 		case LM_MAX:
-			return "Max";
+			return "max";
 			break;
 		case LM_MEAN:
-			return "Mean";
+			return "mean";
 			break;
 		case LM_STDEV:
-			return "Standard Deviation";
+			return "stdev";
 			break;
 		default:
-			return "None";
+			return "none";
 	}
 }
 
@@ -121,16 +121,16 @@ std::string get_w_name(int w)
 	switch(w)
 	{
 		case W_BOX:
-			return "Box";
+			return "box";
 			break;
 		case W_CIRCLE:
-			return "Circle";
+			return "circle";
 			break;
 		case W_GAUSSIAN:
-			return "Gaussian";
+			return "gaussian";
 			break;
 		default:
-			return "Box";
+			return "box";
 	}
 }
 
@@ -147,7 +147,7 @@ std::string get_conf_name(int conf)
 	switch(conf)
 	{
 		case CONF_NONE:
-			return "None";
+			return "none";
 			break;
 		case CONF_ARRGF:
 			return "ARRGF";
@@ -165,7 +165,7 @@ std::string get_conf_name(int conf)
 			return "Convolution";
 			break;
 		default:
-			return "None";
+			return "none";
 	}
 }
 
