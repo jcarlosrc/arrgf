@@ -9,6 +9,9 @@
 #include <vector>
 #include <ctime>
 
+// RGBE support from https://www.graphics.cornell.edu/~bjw/rgbe.html
+#include "rgbe.h"
+
 #include "convolution_kernel.h"
 //#include "bilateral_kernel.h"
 //#include "stddev_kernel.h"
@@ -31,36 +34,158 @@
 //Data type to use for images and images in kernels
 #define type float
 
+#ifndef CTE255
+#define CTE255 255.0f
+#endif
+
+// --- Input types
+#define IMAGE_RGBA 0 // (.hdr)
+#define IMAGE_HDR 1	// (.png)
+#define IMAGE_GRAY16 2	// (.png)
+
+// kernels
+#define KER_NONE -1
+#define KER_GAUSSIAN 0
+#define KER_TUKEY 1
+#define KER_BOX 2
+#define KER_LORENTZ 3
+#define KER_HSINC 4
+#define KER_SINC 5
+#define KER_DELTA 6
+
+std::string get_ker_name(int ker)
+{
+	switch(ker){
+		case KER_NONE:
+			return "none";
+			break;
+		case KER_GAUSSIAN:
+			return std::string("Gaussian");
+			break;
+		case KER_TUKEY:
+			return std::string("Tukey");
+			break;
+		case KER_BOX:
+			return std::string("Box");
+			break;
+		case KER_LORENTZ:
+			return std::string("Lorentz");
+			break;
+		case KER_HSINC:
+			return std::string("Hamming Sinc") ;
+			break;
+		case KER_SINC:
+			return std::string("sinc") ;
+			break;
+		case KER_DELTA:
+			return std::string("Delta");
+			break;
+		default:
+			return std::string("none");
+	}
+}
+
+// Local measure types
+#define LM_NONE -1
+#define LM_MAX 0
+#define LM_MEAN 1
+#define LM_STDEV 2
+
+std::string get_lm_name(int lm)
+{
+	switch(lm)
+	{
+		case LM_NONE:
+			return "None";
+			break;
+		case LM_MAX:
+			return "Max";
+			break;
+		case LM_MEAN:
+			return "Mean";
+			break;
+		case LM_STDEV:
+			return "Standard Deviation";
+			break;
+		default:
+			return "None";
+	}
+}
+
+#define W_BOX 0
+#define W_CIRCLE 1
+#define W_GAUSSIAN 2
+
+std::string get_w_name(int w)
+{
+	switch(w)
+	{
+		case W_BOX:
+			return "Box";
+			break;
+		case W_CIRCLE:
+			return "Circle";
+			break;
+		case W_GAUSSIAN:
+			return "Gaussian";
+			break;
+		default:
+			return "Box";
+	}
+}
+
+// Algorithms
+#define CONF_CONV 4
+#define CONF_BIL 3
+#define CONF_RGF 2
+#define CONF_RRGF 1
+#define CONF_ARRGF 0
+#define CONF_NONE -1
+
+std::string get_conf_name(int conf)
+{
+	switch(conf)
+	{
+		case CONF_NONE:
+			return "None";
+			break;
+		case CONF_ARRGF:
+			return "ARRGF";
+			break;
+		case CONF_RRGF:
+			return "RRGF";
+			break;
+		case CONF_RGF:
+			return "RGF";
+			break;
+		case CONF_BIL:
+			return "Bilateral";
+			break;
+		case CONF_CONV:
+			return "Convolution";
+			break;
+		default:
+			return "None";
+	}
+}
+
 //Block dimensions for Bil
 const int blockBilH = 4;
 const int blockBilW = 16;
-
-
 //Size of blocks for convolution
 const int blockConvH = 16;
 const int blockConvW = 16;
-
-
 // Generic Block Sizes
 int gbsX = 16;
 int gbsY = 16;
 int gbsZ = 1;
 
-#define gpuErrChk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
-{
-   if (code != cudaSuccess) 
-   {
-      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
+// ------------------------------------------------------------------------------------------------------
+/*----------------------  VARIABLES ---------------------------------------------------------------------*/
+// -------------------------------------------------------------------------------------------------------
 
-
-#ifndef CTE255
-#define CTE255 255.0f
-#endif
-
+int input_type = IMAGE_RGBA;	// RGBA png image
+int output_type = IMAGE_RGBA;
 
 int debug = 0;
 std::string debug_name = std::string("no");
@@ -85,7 +210,6 @@ std::string commands_string = "";
 
 // Theoretical frequency cutoff for avoiding aliasing
 type cutoff = 0.5;
-type xic = 1.0/8;
 type calibration_xicxss = 0.4375;
 bool xic_exp = false;
 
@@ -106,7 +230,6 @@ int ss_mod = 1;
 
 int sker_mod = 1;	// allow modifications?
 int sker_exp = 0;	// is explicitly defined?
-std::string sker_name = std::string("gaussian");
 int sker = 0; // gaussian exp(-0.5x**2/ss**2) spatial kernel by default
 //type ss =  0.355 / cutoff;	// sigma value for gaussian
 int sskh = 0;
@@ -118,12 +241,10 @@ int sr_mod = 1;
 
 int rker_mod = 1;
 int rker_exp = 0;
-std::string rker_name = std::string("gaussian");
 int rker = 0; // gaussian intensity kernel by default	
 
 int regker_mod = 1;
 int regker_exp = 0;
-std::string regker_name = std::string("gaussian");
 int regker = 0; // gaussian regularization kernel by default
 type sreg = 0.25 ;
 std::vector<type> sregValues;
@@ -149,13 +270,11 @@ int adaptive = 1;
 
 // Local measure for adaptativeness
 int local_measure = 0; // max
-std::string local_measure_name = std::string("max");
 type sr_ref = 0.48;
 int local_measure_mod = 1;
 int local_measure_exp = 0;
 
 // Local measure weights 
-std::string lweights_name = std::string("gaussian");
 int lweights = 2;	// Gaussian, to achieve smoother transitions. Specially important for lm = ma
 int lweights_mod = 1;
 bool lweights_exp = false;
@@ -167,8 +286,7 @@ int sl_mod = 1;
 int sl_exp = 0;
 
 // Regularization convolution for local measure (like gaussian blur to smooth results)
-std::string lmreg_ker_name = std::string("none");
-int lmreg_ker = -1;
+int lmreg_ker = KER_NONE;
 type lmreg_s = 0.0f;
 bool lmreg_s_exp = false;
 int lmreg_ker_mod = 1;
@@ -176,11 +294,8 @@ int lmreg_ker_exp = 0;
 int lmreg_kh;
 int lmreg_kw;
 
-
-
 int mker_mod = 1;
 int mker_exp = 0;
-std::string mker_name = std::string("none");
 int mker = -1; // No median kernel by default
 type sm = 0;
 int sm_mod = 1;
@@ -188,7 +303,6 @@ int sm_mod = 1;
 int conf_mod = 1;
 int conf_exp = 0;
 int conf = 0; // arrgf by default
-std::string conf_name = std::string("arrgf");
 
 type M = 20;
 
@@ -200,6 +314,8 @@ int iend = 10;
 int print_exp = 0;
 int max_it = -1;
 bool print_all = false;
+
+/* CONVERGENCE */
 
 // conv_norm_list < calc_conv_norm_list < check_conv_norm_list < show_norm_list
 std::vector <std::string> conv_norm_list ;	// Norms for which converging means the algorithm converged and we do not check convergence anymore. All have to converge to say this.
@@ -246,12 +362,13 @@ int show_conv_l2 = 0;
 int conv_l2 = 0;
 int conv_l2loc = 0;
 int conv_max = 0;
+
+/* OTHER OUTPUT */
 // Save log to file also:
 bool save_log = false;
 FILE *log_file;
 std::string log_file_name;
 bool auto_log_string = true;
-
 
 std::string help_string;
 
@@ -276,10 +393,10 @@ bool make_contrast_enhacement = false;
 bool make_contrast_enhacement_linear = false;
 std::vector<type> ce_factor_list;
 
-// ** Conversion to lab for better calculations
-//bool lab = false;
+bool make_hdr_tone_mapping = false;
 
-// ** Adapt sr value for RGF
+
+// ** Adapt sr value for RGF as in thesis
 bool adapt_sr = true;
 
 // *******************************************************************
@@ -332,6 +449,16 @@ int showHelp()
 	return 1;
 }
 
+#define gpuErrChk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+
 void show(type *gpuArray, int n, std::string message)
 {
 	
@@ -379,71 +506,70 @@ int set_conf ( std::string conf_string )
 {
 	if(conf_string.compare(std::string("bilateral")) == 0)
 	{
-		conf = 3;
+		conf = CONF_BIL;
 		adaptive = 0; adaptive_mod = 0;
-		regker = -1; sreg = 0; regker_name = std::string("none"); regker_mod = 0;
-		mker = -1; sm = 0; mker_name = std::string("none"); mker_mod = 0;
-		local_measure = -1; sl = 0; local_measure_name = "none"; local_measure_mod = 0; sl_mod = 0;
+		regker = KER_NONE; sreg = 0; regker_mod = 0;
+		mker = KER_NONE; sm = 0; mker_mod = 0;
+		local_measure = -1; sl = 0; local_measure_mod = 0; sl_mod = 0;
 		if(nit_mod && !nit_exp) nit = 1;
 		
 		conf_mod = 0;
 		conf_exp = 1;
-		
-		conf_name = conf_string;
+
 		return conf;
 	}
 	if(conf_string.compare(std::string("rgf")) == 0)
 	{
-		conf = 2;
+		conf = CONF_RGF;
 		adaptive = 0; adaptive_mod = 0;
-		regker = -1; sreg = 0; regker_name = std::string("none"); regker_mod = 0;
-		mker = -1; sm = 0; mker_name = std::string("none"); mker_mod = 0;
-		local_measure = -1; sl = 0; local_measure_name = "none"; local_measure_mod = 0; sl_mod = 0;
+		regker = -1; sreg = 0; regker_mod = 0;
+		mker = KER_NONE; sm = 0; mker_mod = 0;
+		local_measure = -1; sl = 0;  local_measure_mod = 0; sl_mod = 0;
 		if(nit_mod && !nit_exp) nit = 10;
 		
 		conf_mod = 0;
 		conf_exp = 1;
-		conf_name = conf_string;
+
 		return conf;
 	}
 	if(conf_string.compare(std::string("rrgf")) == 0)
 	{
-		conf = 1;
+		conf = CONF_RRGF;
 		adaptive = 0; adaptive_mod = 0;
-		mker = -1; sm = 0; mker_name = std::string("none"); mker_mod = 0;
-		local_measure = -1; sl = 0; local_measure_name = "none"; local_measure_mod = 0;
+		mker = KER_NONE; sm = 0;  mker_mod = 0;
+		local_measure = -1; sl = 0; local_measure_mod = 0;
 		if(nit_mod && !nit_exp) nit = 10;
 		
 		conf_mod = 0;
 		conf_exp = 1;
-		conf_name = conf_string;
+
 		return conf;
 	}
-	if(conf_string.compare(std::string("arrgf")) == 0 || conf_string.compare(std::string("argf")) == 0)
+	if(conf_string.compare(std::string("arrgf")) == 0 )
 	{
-		conf = 0;
+		conf = CONF_ARRGF;
 		adaptive = 1; adaptive_mod = 0;
-		mker = -1; sm = 0; mker_name = std::string("none"); mker_mod = 0;
+		mker = KER_NONE; sm = 0; mker_mod = 0;
 		if(nit_mod && !nit_exp) nit = 10;
 		
 		conf_mod = 0;
 		conf_exp = 1;
-		conf_name = conf_string;
+
 		return conf;
 	}
 	if(conf_string.compare(std::string("conv")) == 0 || conf_string.compare(std::string("convolution")) == 0)
 	{
-		conf = 4;
+		conf = CONF_CONV;
 		adaptive = 0; adaptive_mod = 0;
-		regker = -1; sreg = 0; regker_name = std::string("none"); regker_mod = 0;
-		mker = -1; sm = 0; mker_name = std::string("none"); mker_mod = 0;
-		local_measure = -1; sl = 0; local_measure_name = "none"; local_measure_mod = 0;
-		rker = -1; rker_name = "none"; rker_mod = 0;
+		regker = KER_NONE; sreg = 0; regker_mod = 0;
+		mker = KER_NONE; sm = 0; mker_mod = 0;
+		local_measure = LM_NONE; sl = 0;  local_measure_mod = 0;
+		rker = -1; rker_mod = 0;
 		if(nit_mod && !nit_exp) nit = 1;
 		
 		conf_mod = 0;
 		conf_exp = 1;
-		conf_name = conf_string;
+
 		return conf;
 	}
 	return conf;
@@ -504,37 +630,60 @@ int main(int nargs, char** args){
 	
 		std::string pname = std::string(args[argi]);
 		argi ++;
-		
-		//if(argi >= nargs) break;
 
-		if(pname == "-adapt-sr" || pname == "-asr")
+		/* INPUT AND OUTPUT TYPES AND SPECS */
+
+		if(pname.compare(std::string("-input")) == 0 || pname.compare(std::string("-in")) == 0)
 		{
-			adapt_sr = true;
+			//printf("Input : ");
+			input_name = std::string(args[argi]);
+			argi++;
+			//printf("%s\n", input_name.data());
 		}
-	
-		if(pname.compare("-load-it") == 0)
-		{
-			if(argi + 3 < nargs)
-			{
-				load_it = true;
-				it_from = atoi(args[argi]);
-				argi ++;
-				
-				std::string next_arg = std::string(args[argi]);
-				argi ++;
-				if(next_arg.compare("from-png") == 0 || next_arg.compare("from-image") == 0 || next_arg.compare("from-im") == 0)
-				{
-					it_from_image_name = std::string(args[argi]);
-					argi++;
-				}
-				if(next_arg.compare("from-png-linear") == 0 || next_arg.compare("from-image-linear") == 0 || next_arg.compare("from-im-lin") == 0)
-				{
-					gammacor_load_it = false;
-					it_from_image_name = std::string(args[argi]);
-					argi++;
-				}
-			}
 
+		if(pname.compare(std::string("-output")) == 0 || pname.compare(std::string("-out")) == 0)
+		{
+			//printf("Output: ");
+			output_name = std::string(args[argi]);
+			argi++;
+			//printf("%s\n", output_name.data());
+			make_output_default = 0;
+			
+		}
+		if(pname == "-hdr-input" || pname == "-input-hdr")
+		{
+			input_type = IMAGE_HDR;
+		}
+
+		if(pname == "-hdr-tone-mapping" || pname == "-hdrtm")
+		{
+			make_hdr_tone_mapping = true;
+		}
+
+		/* ------- OTHER OUTPUT FILES */
+
+		if (pname.compare("-log") == 0 || pname.compare(">") == 0)
+		{
+			auto_log_string = false;
+			save_log = true;
+			if(argi < nargs)
+			{
+				log_file_name = std::string(args[argi]);
+				argi ++;
+			}
+			
+			if (log_file_name.compare("auto") == 0)
+			{
+				auto_log_string = true;
+				log_file_name = "";
+			}
+		}
+		
+		if (pname.compare("-log-auto") == 0 || pname.compare("-make-log") == 0)
+		{
+			save_log = true;
+			log_file_name = std::string("");
+			auto_log_string = true;
 		}
 		
 		if(pname == "-print-diff" || pname == "print-diff-gamma")
@@ -593,781 +742,7 @@ int main(int nargs, char** args){
 			print_gamma = false;
 			print_linear = false;
 		}
-		if (pname.compare("-test") == 0)
-		{
-			printf("-test\n");
-			input_name = "../images/barbara/barbara.png";
-			output_name = "../test/barbara";
-			
-			std::string conf_string = std::string(args[argi]);
-			argi++;
 
-			set_conf(conf_string);
-			// Deafult parameters values
-			ssValues.push_back(3.0);
-			if (conf == 0) srValues.push_back(0.5);
-			else if (conf == 1 || conf ==2) srValues.push_back(0.05);
-			scaleValues.push_back(1.0);
-			
-		}
-		
-		if(pname.compare("-conf") == 0)
-		{
-			if(pname.compare("all") == 0)
-			{
-				check_and_add(&conf_list, conf_all);
-			}
-			else
-			{
-				if(conf_mod)
-				{				
-					std::string conf_string = std::string(args[argi]);
-					argi ++;
-
-					set_conf(conf_string);
-				}
-			}
-			printf("conf\n");
-
-		}
-		// Express configurations
-		if(pname.compare("-arrgf") == 0)
-		{
-			if(conf_mod)
-			{
-				set_conf(std::string("arrgf"));
-			}
-		}
-		if(pname.compare("-rrgf") == 0)
-		{
-			if(conf_mod)
-			{
-				set_conf(std::string("rrgf"));
-			}
-		}
-		if(pname.compare("-rgf") == 0)
-		{
-			if(conf_mod)
-			{
-				set_conf(std::string("rgf"));
-			}
-		}
-		if(pname.compare("-conv") == 0 || pname.compare("-convolution") == 0)
-		{
-			if(conf_mod)
-			{
-				set_conf(std::string("conv"));
-			}
-		}
-		if(pname.compare("-bilateral") == 0|| pname.compare("-bil") == 0)
-		{
-			if(conf_mod)
-			{
-				set_conf(std::string("bilateral"));
-			}
-		}
-		// Stack for showing norm values between iterations. 
-		if(pname.compare("-show-norm") == 0 || pname.compare("-show-norms") == 0 || pname.compare("-show-conv-print-norm") == 0 || pname.compare("-show-conv-print-norms") == 0 || pname.compare("-show-conv-print") == 0|| pname.compare("-show-conv-norms") == 0 || pname.compare("-show-conv") == 0 || pname.compare("-show-conv-norm") == 0)
-		{
-			
-			show_norm_exp = true;
-			if(pname.compare("-show-conv-norms") == 0 || pname.compare("-show-conv") == 0 || pname.compare("-show-conv-norm") == 0)
-			{
-				show_conv = true;
-			}
-			if(pname.compare("-show-conv-print") == 0 || pname.compare("-show-conv-print-norms") || pname.compare("-show-conv-print-norm") == 0)
-			{
-				show_conv = true;
-				print_alt_conv = true;
-			}
-			
-			std::string norm_string = std::string(args[argi]);
-			argi ++;
-			
-			if (norm_string.compare("all") == 0)
-			{
-				//norm_string = std::string("l2");
-				check_and_add(&show_norm_list, all_norms);
-			
-			}
-			else if( validate_string(all_norms, norm_string) )
-			{
-				check_and_add(&show_norm_list, norm_string);
-					
-				int go = 1;
-
-				
-				while(go == 1 && argi < nargs)
-				{
-					std::string temp = std::string(args[argi]);
-					argi++;
-
-					if(temp.compare("and") == 0 || temp.compare(",") == 0 && argi+1 < nargs)
-					{
-						norm_string = std::string(args[argi]);
-						argi++;
-						check_and_add(&show_norm_list, norm_string);
-						/*if(isInVector(norm_vector, norm_string, 0 ) < 0 )
-						{
-							printf("\nAdding %s norm to stack", norm_string.data());
-							norm_vector.push_back(norm_string);
-						}*/
-							
-						go = 1;
-					}
-					else
-					{
-						argi--;
-						go = 0;
-					}			
-				}	
-			} 
-			else
-			{
-				argi --;
-			}
-		}
-		// add ALL norms for showing
-		if (pname.compare("-show-norm-all") == 0 || pname.compare("-show-all-norms") == 0 || pname.compare("-show-conv-print-all") == 0 || pname.compare("-show-conv-all") == 0)
-		{			
-			calc_norms = true;
-			check_and_add(&show_norm_list, all_norms);
-			
-			if(pname.compare("-show-conv-all") == 0)
-			{
-				show_conv = true;
-			}
-			if(pname.compare("-show-conv-print-all") == 0)
-			{
-				show_conv = true;
-				print_alt_conv = true;
-			}
-			
-			show_norm_exp = true;
-
-		}
-		
-		if(pname.compare("-show-conv") == 0)
-		{
-			show_conv = true;
-		}
-		
-		if(pname.compare("-show-conv-print") == 0)
-		{
-			show_conv = true;
-			print_alt_conv = true;
-		}
-
-		
-		if(pname.compare("-conv-norm") == 0 || pname.compare("-conv-norms") == 0 || pname.compare("-convergence-norms") == 0 || pname.compare("-convergence-norm") == 0)
-		{
-			
-			conv_norm_exp = true;
-			calc_norms = true;
-			
-			std::string norm_string = std::string(args[argi]);
-			argi ++;
-			
-			if (norm_string.compare("all") == 0)
-			{
-				check_and_add(&conv_norm_list, all_norms);
-			
-			}
-			else if( validate_string(all_norms, norm_string) )
-			{
-				check_and_add(&conv_norm_list, norm_string);
-					
-				int go = 1;
-
-				
-				while(go == 1 && argi < nargs)
-				{
-					std::string temp = std::string(args[argi]);
-					argi++;
-
-					if(temp.compare("and") == 0 || temp.compare(",") == 0 && argi+1 < nargs)
-					{
-						norm_string = std::string(args[argi]);
-						argi++;
-						check_and_add(&conv_norm_list, norm_string);
-							
-						go = 1;
-					}
-					else
-					{
-						argi--;
-						go = 0;
-					}			
-				}	
-			} 
-			else
-			{
-				argi --;
-			}
-		}
-		
-		if(pname.compare("-conv-eps") == 0)
-		{
-			
-			conv_eps_exp = true;
-			calc_norms = true;
-			
-			type eps_value = atof(args[argi]);
-			argi ++;
-			
-			check_and_add(&conv_eps_list, eps_value);
-				
-			int go = 1;
-
-			
-			while(go == 1 && argi < nargs)
-			{
-				std::string temp = std::string(args[argi]);
-				argi++;
-
-				if(temp.compare("and") == 0 || temp.compare(",") == 0 && argi+1 < nargs)
-				{
-					type eps_value = atof(args[argi]);
-					argi++;
-					check_and_add(&conv_eps_list, eps_value);
-						
-					go = 1;
-				}
-				else
-				{
-					argi--;
-					go = 0;
-				}			
-			}	
-		}
-
-		// add ALL norms to the convergence criteria
-		if (pname.compare("-conv-norm-all") == 0 || pname.compare("-conv-all-norms") == 0)
-		{			
-			
-			conv_norm_exp = true;
-			check_and_add(&conv_norm_list, all_norms);
-			calc_norms = true;
-
-		}
-
-		if (pname.compare("-log") == 0 || pname.compare(">") == 0)
-		{
-			auto_log_string = false;
-			save_log = true;
-			if(argi < nargs)
-			{
-				log_file_name = std::string(args[argi]);
-				argi ++;
-			}
-			
-			if (log_file_name.compare("auto") == 0)
-			{
-				auto_log_string = true;
-				log_file_name = "";
-			}
-		}
-		
-		if(pname.compare("-log-auto") == 0 )
-		{
-			auto_log_string = true;
-			save_log = true;
-		}
-		
-		if (pname.compare("-log-auto") == 0 || pname.compare("-make-log") == 0)
-		{
-			save_log = true;
-			log_file_name = std::string("");
-		}
-		
-		if( pname.compare("-no-stop-showing-on-convergence") == 0 || pname.compare("-no-stop-showing-on-conv") == 0)
-		{
-			stop_showing_on_convergence = false;
-		}
-		if( pname.compare("-stop-showing-on-convergence") == 0 || pname.compare("-stop-showing-on-conv") == 0)
-		{
-			stop_showing_on_convergence = true;
-		}
-		
-		if( pname.compare("-stop-on-conv") == 0 || pname.compare("-stop-on-convergence") == 0 || pname.compare("-stop-conv") == 0 || pname.compare("-force-stop-on-convergence") == 0 || pname.compare("-fs") == 0 || pname.compare("-force-stop") == 0 || pname.compare("-force-stop-on-conv") == 0)
-		{
-			calc_norms = true;
-			force_stop_on_convergence = true;
-		}
-		
-		if(pname.compare("-max-it") == 0)
-		{
-			max_it = atoi(args[argi]);
-			printf("-max-it");
-			argi++;
-		}
-		// Input file
-		if(pname.compare(std::string("-input")) == 0 || pname.compare(std::string("-in")) == 0)
-		{
-			//printf("Input : ");
-			input_name = std::string(args[argi]);
-			argi++;
-			//printf("%s\n", input_name.data());
-		}
-		// Output file
-		if(pname.compare(std::string("-output")) == 0 || pname.compare(std::string("-out")) == 0)
-		{
-			//printf("Output: ");
-			output_name = std::string(args[argi]);
-			argi++;
-			//printf("%s\n", output_name.data());
-			make_output_default = 0;
-			
-		}
-		// Check for iterations to print in the format x1 and x2 and x3 to x4 to x5 and x6 ... 
-		if(pname.compare("-print-it") == 0 || pname.compare("-print-it-linear") == 0 || pname.compare("-print-it-gamma") == 0 || pname == "-nit" || pname == "-it" || pname == "-calc-it" /* Legacy */)
-		{
-			if(pname.compare("-print-it-linear") == 0 || pname.compare("-print-linear") == 0)
-			{
-				print_linear = true;
-			}
-			if(pname.compare("-print-it-gamma") == 0 || pname.compare("-print-it-gamma") == 0 || pname.compare("-print-it") == 0 )
-			{
-				print_gamma = true;
-			}
-			std::string option = std::string(args[argi]);
-			if(option.compare("all") == 0)
-			{
-				print_all = true;
-				argi++;
-			}
-			else
-			{
-				print_exp = 1;
-				it_list.clear();
-				argi = read_input_list(&it_list, args, argi, nargs);
-			}
-
-		}
-		if(pname == "-print-its-gamma" || pname == "-print-its" || pname == "-print-iterations-gamma")
-		{
-			print_gamma = true;
-		}
-		if(pname == "-print-its-linear" || pname == "-print-iterations-linear")
-		{
-			print_linear = true;
-		}
-		if(pname.compare("-print-all") == 0 || pname.compare("-print-all-gamma") == 0)
-		{
-			print_all = true;
-			print_gamma = true;
-		}
-		if(pname.compare("-print-all-linear") == 0)
-		{
-			print_all = true;
-			print_linear = true;
-			
-		}
-		
-		// Check for list of sr values
-		if(pname.compare("-sr") == 0)
-		{
-			srValues.clear();
-			argi = read_input_list(&srValues, args, argi, nargs);
-			sr_exp = true;
-		}
-		
-		// Check for list of ss values
-		if(pname.compare("-ss") == 0)
-		{
-			ssValues.clear();
-			argi = read_input_list(&ssValues, args, argi, nargs);			
-		}
-		// Regularization
-		if(pname.compare(std::string("-sreg")) == 0 || pname.compare("-s") == 0 || pname.compare("-reg-sigma") == 0 || pname.compare("-regularization-sigma") == 0 || pname.compare("-regs") == 0)
-		{
-			if(sreg_mod )
-			{
-				sreg_exp = true;
-				sregValues.clear();
-				argi = read_input_list(&sregValues, args, argi, nargs);
-			}
-		}
-		if (pname == "-xic")
-		{
-			ssValues.clear();
-			argi = read_input_list(&ssValues, args, argi, nargs);
-			xic2ss<type>(ssValues, calibration_xicxss);
-			xic_exp = true;
-		}
-		
-		// Change xicxss
-		if (pname == "-xicxss" || pname == "-calibration-xicxss")
-		{
-			calibration_xicxss = atof(args[argi]);
-			argi++;
-		}
-
-		// Check for list of scale values
-
-		if(pname.compare("-scale") == 0)
-		{
-			scaleValues.clear();
-			argi = read_input_list(&scaleValues, args, argi, nargs);
-			scale_exp = true;
-
-		}
-		
-		if (pname.compare("-sb") == 0 || pname.compare("-scale-back") == 0)
-		{
-			scale_back = 1;
-			scale_back_name = "yes";
-		}
-		
-		// Show help
-		if(pname.compare(std::string("-help")) == 0)
-		{
-			showHelp();	
-			argi++;
-		}
-		
-		if(pname.compare(std::string("-infsr")) == 0)
-		{
-			infsr_exp = true;
-			infsr = atof(args[argi]);
-			argi++;
-		}
-		/*if(pname.compare(std::string("scale")) == 0)
-		{
-			scale = atof(args[argi]);
-			argi++;
-		}*/
-		if(pname.compare(std::string("-cutoff")) == 0)
-		{
-			cutoff = atof(args[argi]);
-			argi++;
-		}
-		if(pname.compare(std::string("-lm")) == 0 || pname.compare(std::string("-local-measure")) == 0 || pname == "-local_measure" || pname == "-lmker" || pname == "local-measure-kernel")
-		{
-			std::string temp = std::string(args[argi]);
-			argi ++;
-
-			if(temp.compare(std::string("max")) == 0)
-			{
-				local_measure = 0;
-				local_measure_name = temp;
-				local_measure_exp = 1;
-				sr_ref = 0.48;
-			}
-			if(temp.compare(std::string("mean")) == 0)
-			{
-				local_measure = 1;
-				local_measure_name = temp;
-				local_measure_exp = 1;
-				sr_ref = 0.33;
-			}
-			if(temp.compare(std::string("stdev")) == 0)
-			{
-				local_measure = 2;
-				local_measure_name = temp;
-				local_measure_exp = 1;
-				sr_ref = 0.35;
-			}else
-			{
-				argi--;
-			}
-		}
-		
-		if(pname == "-lweights" || pname == "-lw" || pname == "-local-weights")
-		{
-				std::string option = std::string(args[argi]);				
-				argi++;
-				
-				if(option == "circle")
-				{
-					lweights_name = "circle";
-					lweights = 1;
-					lweights_exp = true;
-				}
-				if(option == "gaussian")
-				{
-					lweights_name = "gaussian";
-					lweights = 2;
-					lweights_exp = true;
-				}
-				if(option == "none" || option == "box" || option == "constant")
-				{
-					lweights_name = "box";
-					lweights_exp = true;
-					lweights = 0;
-				}
-				else
-				{
-					argi --;
-				}
-		}
-		
-		if(pname == "-lweights-s" || pname == "-lws" || pname == "-local-weights-sigma" || pname == "-lw-sigma")
-		{
-			if(sl_mod)
-			{
-				sl = atof(args[argi]);
-				sl_exp = 1;
-			}
-			argi ++;
-		}
-		// Regularization for local measure
-		if( lmreg_ker_mod && ( pname.compare("-lmreg-ker") == 0 || pname.compare("-lm-reg") == 0 || pname.compare("-lm-reg-ker") == 0|| pname.compare("-lmregker") == 0 || pname == "-lmreg" ) )
-		{
-			std::string temp = std::string(args[argi]);
-			argi++;
-			
-			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0 || temp.compare("no") == 0)
-			{
-				lmreg_ker = -1;
-				lmreg_s = 0;
-				lmreg_ker_exp = 1;
-				lmreg_ker_name = temp;
-			}else
-			if(temp.compare(std::string("gaussian")) == 0){
-				lmreg_ker = 0;
-				lmreg_ker_exp = 1;
-				lmreg_ker_name = temp;
-				
-			} else
-			if(temp.compare(std::string("tukey")) == 0) {
-				lmreg_ker = 1;
-				lmreg_ker_exp = 1;
-				lmreg_ker_name = temp;
-			} else
-			if(temp.compare(std::string("box")) == 0) {
-				lmreg_ker = 2;
-				lmreg_ker_exp = 1;
-				lmreg_ker_name = temp;
-			}
-			else
-			{
-				argi--;
-			}
-		}
-		// sigma value for local measure regularization
-		if(pname.compare("-lm-reg-s") == 0 || pname.compare("-lmreg-s") == 0 || pname.compare("-lmregs") == 0 || pname.compare("-lmreg-sigma") == 0 || pname.compare("-local-measure-reg-sigma") == 0 || pname.compare("-local-measure-reg-s") == 0 || pname == "-ls" || pname == "-sl")
-		{
-			// If we have not set kernel, gaussian by default
-			if(lmreg_ker_exp == 0)
-			{
-				lmreg_ker = 0;
-				lmreg_ker_name = std::string("gaussian");
-			}
-			lmreg_s = atof(args[argi]);
-			lmreg_s_exp = true;
-			argi++;
-		}
-
-		if(pname.compare(std::string("-sm")) == 0)
-		{
-			if(sm_mod)
-				sm = atof(args[argi]);
-			argi ++;
-		}
-	
-		// Check for adaptive
-		if(adaptive_mod && (pname.compare("-adaptive") == 0 || pname.compare("-a") == 0))
-		{
-			adaptive = 1;
-			adaptive_exp = 1;
-		}
-		if(pname.compare("-no-adaptive") == 0 || pname.compare("-adaptive-no") == 0)
-		{
-			adaptive = 0;
-			adaptive_exp = 1;
-		}
-		// debug
-
-		if(pname.compare("-d") == 0 || pname.compare("-debug") == 0)
-			debug = 1;
-
-		// Spatial Kernel
-		if(sker_mod && (pname.compare("-sker") == 0 || pname.compare(std::string("-spatial-kernel")) == 0 || pname.compare("-spatial") == 0 || pname.compare("-spatialocal_measure") == 0 || pname.compare("-spatial-ker") == 0) || pname.compare("-ssker") == 0 )
-		{
-			std::string temp = std::string(args[argi]);
-			argi ++;
-	
-			if(temp.compare(std::string("gaussian")) == 0){
-				
-				sker = 0;
-				sker_exp = 1;
-				
-				sker_name = temp;
-				
-			} else
-			if(temp.compare(std::string("tukey")) == 0) {	
-				sker_exp = 1;
-				sker = 1;		
-				
-				sker_name = temp;
-				
-			} else
-			if(temp.compare(std::string("box")) == 0) {	
-				sker_exp = 1;
-				sker = 2;
-				sker_name = temp;
-			} else
-			if(temp.compare(std::string("lorentz")) == 0) {
-				sker_exp = 1;
-				sker = 3;
-				sker_name = temp;
-
-			}
-			else if(temp == "hamming-sinc" || temp == "hsinc")
-			{
-				sker_exp =1;
-				sker = 4;
-				M = atof(args[argi]);
-				argi --;
-				
-				sker_name = temp + "_" + Patch::to_string(M);
-
-			}
-			else if(temp.compare(std::string("sinc")) == 0)
-			{
-				sker_exp = 1;
-				sker = 5;
-				M = atof(args[argi]);
-				argi --;
-				
-				sker_name = temp + "_" + Patch::to_string(M);
-				
-			}
-			else if(temp.compare("delta") == 0)
-			{
-				sker_exp = 1;
-				sker = 6;
-				sker_name = temp;
-			}
-			else{
-				argi --;
-			}
-			
-		}
-
-		// Range kernel
-		if(rker_mod && ( pname.compare(std::string("-rker")) == 0 || pname.compare(std::string("-intensity-kernel")) == 0 || pname.compare(std::string("-range-kernel")) == 0 || pname.compare("-range") == 0 ))
-		{	
-			
-			std::string temp = std::string(args[argi]);
-			argi ++;
-			
-			if(temp.compare(std::string("none")) == 0 || rker_name.compare(std::string("off")) == 0){	
-				rker = -1;
-				
-				srValues.clear();
-				srValues.push_back(0.0f);
-				
-				rker_exp = 1;
-				rker_name = temp;
-			} else
-	
-			if(temp.compare(std::string("gaussian")) == 0){	
-				rker = 0; 			
-				rker_exp = 1;
-				rker_name = temp;
-			} else
-			if(temp.compare(std::string("tukey")) == 0) {	
-				rker = 1;			
-				rker_exp = 1;
-				rker_name = temp;
-			} else
-			if(temp.compare(std::string("box")) == 0) {		
-				rker = 2;
-				rker_exp = 1;
-				rker_name = temp;
-			} else 
-			if(temp.compare(std::string("lorentz")) == 0) {
-				rker = 3;
-				rker_exp = 1;
-			}
-			else {
-				argi --;
-			}
-			
-		}
-	
-		// Check for Regularization Kernel
-		if(regker_mod && (pname.compare(std::string("-regker")) == 0 || pname.compare(std::string("-reg-kernel")) == 0 || pname.compare("-reg") == 0 || pname.compare("-regularization-kernel") == 0 ))
-		{
-			
-			// Regularization kernel
-			std::string temp = std::string(args[argi]);
-			argi ++;
-			
-			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0 || temp.compare("no") == 0)
-			{
-				regker = -1;
-				sreg = 0;
-				regker_exp = 1;
-				regker_name = temp;
-			}else
-	
-			if(temp.compare(std::string("gaussian")) == 0){
-				regker = 0;
-				regker_exp = 1;
-				regker_name = temp;
-			} else
-			if(temp.compare("tukey") == 0)
-			{
-				regker = 1;
-				regker_exp = 1;
-				regker_name = temp;
-			} else
-			if(regker_name.compare(std::string("box")) == 0) {
-				regker = 2;
-				regker_exp = 1;
-				regker_name = temp;
-			} else
-			{
-				argi--;
-			}
-			
-		}
-		
-		if(pname.compare(std::string("-mker")) == 0 && mker_mod)
-		{
-			std::string temp = std::string(args[argi]);
-			argi ++;
-
-			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0)
-			{
-				mker = -1;
-				sm = 0;				
-				mker_exp = 1;
-				mker_name = temp;
-			}
-			if(temp.compare(std::string("gaussian")) == 0)
-			{
-				mker = 0;
-				mker_exp = 1;
-				mker_name = temp;
-			} else
-			if(temp.compare(std::string("tukey")) == 0)
-			{
-				mker = 1;				
-				mker_exp = 1;
-				mker_name = temp;
-			} else
-			if(temp.compare(std::string("box")) == 0)
-			{
-				mker = 2;				
-				mker_exp = 1;
-				mker_name = temp;
-			} else
-			if(temp.compare(std::string("lorentz")) == 0)
-			{
-				mker = 3;
-				
-				mker_exp = 1;
-				mker_name = temp;
-			} else
-			{
-				argi--;
-			}
-		}
-		
 		// Gamma or linear input/output
 		if (pname.compare("-g") == 0|| pname.compare("-gamma") == 0 )
 		{
@@ -1447,9 +822,7 @@ int main(int nargs, char** args){
 			print_local_measure_linear = true;
 		}
 		
-		
-		// CONTRAST ENHACEMENT / REDUCTION
-		
+		// Contrast enhancement
 		if(pname == "-print-contrast-enhancement" || pname == "-print-ce" || pname == "-print-ce-gamma" || pname == "-print-contrast-enhancement-gamma")
 		{
 			make_contrast_enhacement = true;
@@ -1469,6 +842,639 @@ int main(int nargs, char** args){
 			make_contrast_enhacement_linear = true;
 			ce_factor_list.clear();
 			argi = read_input_list(&ce_factor_list, args, argi, nargs);
+		}
+
+
+		/* ALGORITHMS */
+		
+		if(pname.compare("-conf") == 0)
+		{
+			if(pname.compare("all") == 0)
+			{
+				check_and_add(&conf_list, conf_all);
+			}
+			else
+			{
+				if(conf_mod)
+				{				
+					std::string conf_string = std::string(args[argi]);
+					argi ++;
+
+					set_conf(conf_string);
+				}
+			}
+			printf("conf\n");
+
+		}
+
+
+		/* ALGORITHMS */
+
+		if(pname.compare("-arrgf") == 0)
+		{
+			if(conf_mod)
+			{
+				set_conf(std::string("arrgf"));
+			}
+		}
+		if(pname.compare("-rrgf") == 0)
+		{
+			if(conf_mod)
+			{
+				set_conf(std::string("rrgf"));
+			}
+		}
+		if(pname.compare("-rgf") == 0)
+		{
+			if(conf_mod)
+			{
+				set_conf(std::string("rgf"));
+			}
+		}
+		if(pname.compare("-conv") == 0 || pname.compare("-convolution") == 0)
+		{
+			if(conf_mod)
+			{
+				set_conf(std::string("conv"));
+			}
+		}
+		if(pname.compare("-bilateral") == 0|| pname.compare("-bil") == 0)
+		{
+			if(conf_mod)
+			{
+				set_conf(std::string("bilateral"));
+			}
+		}
+
+		/* CONVERGENCE */
+		// Stack for showing norm values between iterations. 
+		if(pname.compare("-show-norm") == 0 || pname.compare("-show-norms") == 0 || pname.compare("-show-conv-print-norm") == 0 || pname.compare("-show-conv-print-norms") == 0 || pname.compare("-show-conv-print") == 0|| pname.compare("-show-conv-norms") == 0 || pname.compare("-show-conv") == 0 || pname.compare("-show-conv-norm") == 0)
+		{
+			
+			show_norm_exp = true;
+			if(pname.compare("-show-conv-norms") == 0 || pname.compare("-show-conv") == 0 || pname.compare("-show-conv-norm") == 0)
+			{
+				show_conv = true;
+			}
+			if(pname.compare("-show-conv-print") == 0 || pname.compare("-show-conv-print-norms") || pname.compare("-show-conv-print-norm") == 0)
+			{
+				show_conv = true;
+				print_alt_conv = true;
+			}
+			
+			std::string norm_string = std::string(args[argi]);
+			argi ++;
+			
+			if (norm_string.compare("all") == 0)
+			{
+				//norm_string = std::string("l2");
+				check_and_add(&show_norm_list, all_norms);
+			
+			}
+			else
+			{
+				argi --;
+				argi = read_and_validate_input_list(&show_norm_list, &all_norms, args, argi, nargs, false);
+			}
+
+		}
+
+		// add ALL norms for showing
+		if (pname.compare("-show-norm-all") == 0 || pname.compare("-show-all-norms") == 0 || pname.compare("-show-conv-print-all") == 0 || pname.compare("-show-conv-all") == 0)
+		{			
+			calc_norms = true;
+			check_and_add(&show_norm_list, all_norms);
+			
+			if(pname.compare("-show-conv-all") == 0)
+			{
+				show_conv = true;
+			}
+			if(pname.compare("-show-conv-print-all") == 0)
+			{
+				show_conv = true;
+				print_alt_conv = true;
+			}
+			
+			show_norm_exp = true;
+
+		}
+		
+		if(pname.compare("-show-conv") == 0)
+		{
+			show_conv = true;
+		}
+		
+		if(pname.compare("-show-conv-print") == 0)
+		{
+			show_conv = true;
+			print_alt_conv = true;
+		}
+
+		
+		if(pname.compare("-conv-norm") == 0 || pname.compare("-conv-norms") == 0 || pname.compare("-convergence-norms") == 0 || pname.compare("-convergence-norm") == 0)
+		{
+			
+			conv_norm_exp = true;
+			calc_norms = true;
+			
+			std::string norm_string = std::string(args[argi]);
+			argi ++;
+			
+			if (norm_string.compare("all") == 0)
+			{
+				check_and_add(&conv_norm_list, all_norms);
+			
+			}
+			else
+			{
+				argi --;
+				argi = read_and_validate_input_list(&conv_norm_list, &all_norms, args, argi, nargs, false);
+			}
+		}
+		
+		// Check for list of eps for convergence
+		if(pname.compare("-conv-eps") == 0)
+		{
+			conv_eps_list.clear();
+			argi = read_input_list(&conv_eps_list, args, argi, nargs);
+			conv_eps_exp = true;
+			calc_norms = true;
+		}
+
+
+		if( pname.compare("-no-stop-showing-on-convergence") == 0 || pname.compare("-no-stop-showing-on-conv") == 0)
+		{
+			stop_showing_on_convergence = false;
+		}
+		if( pname.compare("-stop-showing-on-convergence") == 0 || pname.compare("-stop-showing-on-conv") == 0)
+		{
+			stop_showing_on_convergence = true;
+		}
+		
+		if( pname.compare("-stop-on-conv") == 0 || pname.compare("-stop-on-convergence") == 0 || pname.compare("-stop-conv") == 0 || pname.compare("-force-stop-on-convergence") == 0 || pname.compare("-fs") == 0 || pname.compare("-force-stop") == 0 || pname.compare("-force-stop-on-conv") == 0)
+		{
+			calc_norms = true;
+			force_stop_on_convergence = true;
+		}
+
+		// add ALL norms to the convergence criteria
+		if (pname.compare("-conv-norm-all") == 0 || pname.compare("-conv-all-norms") == 0)
+		{			
+			
+			conv_norm_exp = true;
+			check_and_add(&conv_norm_list, all_norms);
+			calc_norms = true;
+
+		}
+
+		/* ITERATIONS */	
+		
+		if(pname.compare("-max-it") == 0)
+		{
+			max_it = atoi(args[argi]);
+			printf("-max-it");
+			argi++;
+		}
+
+		// Check for iterations to print in the format x1 and x2 and x3 to x4 to x5 and x6 ... 
+		if(pname.compare("-print-it") == 0 || pname.compare("-print-it-linear") == 0 || pname.compare("-print-it-gamma") == 0 || pname == "-nit" || pname == "-it" || pname == "-calc-it" /* Legacy */)
+		{
+			if(pname.compare("-print-it-linear") == 0 || pname.compare("-print-linear") == 0)
+			{
+				print_linear = true;
+			}
+			if(pname.compare("-print-it-gamma") == 0 || pname.compare("-print-it-gamma") == 0 || pname.compare("-print-it") == 0 )
+			{
+				print_gamma = true;
+			}
+			std::string option = std::string(args[argi]);
+			if(option.compare("all") == 0)
+			{
+				print_all = true;
+				argi++;
+			}
+			else
+			{
+				print_exp = 1;
+				it_list.clear();
+				argi = read_input_list(&it_list, args, argi, nargs);
+			}
+
+		}
+		if(pname == "-print-its-gamma" || pname == "-print-its" || pname == "-print-iterations-gamma")
+		{
+			print_gamma = true;
+		}
+		if(pname == "-print-its-linear" || pname == "-print-iterations-linear")
+		{
+			print_linear = true;
+		}
+		if(pname.compare("-print-all") == 0 || pname.compare("-print-all-gamma") == 0)
+		{
+			print_all = true;
+			print_gamma = true;
+		}
+		if(pname.compare("-print-all-linear") == 0)
+		{
+			print_all = true;
+			print_linear = true;
+			
+		}
+
+		if(pname.compare("-load-it") == 0)
+		{
+			if(argi + 3 < nargs)
+			{
+				load_it = true;
+				it_from = atoi(args[argi]);
+				argi ++;
+				
+				std::string next_arg = std::string(args[argi]);
+				argi ++;
+				if(next_arg.compare("from-png") == 0 || next_arg.compare("from-image") == 0 || next_arg.compare("from-im") == 0)
+				{
+					it_from_image_name = std::string(args[argi]);
+					argi++;
+				}
+				if(next_arg.compare("from-png-linear") == 0 || next_arg.compare("from-image-linear") == 0 || next_arg.compare("from-im-lin") == 0)
+				{
+					gammacor_load_it = false;
+					it_from_image_name = std::string(args[argi]);
+					argi++;
+				}
+			}
+
+		}
+
+		/* ARRGF PARAMETERS */
+		
+		// Check for list of sr values
+		if(pname.compare("-sr") == 0)
+		{
+			srValues.clear();
+			argi = read_input_list(&srValues, args, argi, nargs);
+			sr_exp = true;
+		}
+		
+		// Check for list of ss values
+		if(pname.compare("-ss") == 0)
+		{
+			ssValues.clear();
+			argi = read_input_list(&ssValues, args, argi, nargs);			
+		}
+		// Regularization
+		if(pname.compare(std::string("-sreg")) == 0 || pname.compare("-s") == 0 || pname.compare("-reg-sigma") == 0 || pname.compare("-regularization-sigma") == 0 || pname.compare("-regs") == 0)
+		{
+			if(sreg_mod )
+			{
+				sreg_exp = true;
+				sregValues.clear();
+				argi = read_input_list(&sregValues, args, argi, nargs);
+			}
+		}
+		if (pname == "-xic")
+		{
+			ssValues.clear();
+			argi = read_input_list(&ssValues, args, argi, nargs);
+			xic2ss<type>(ssValues, calibration_xicxss);
+			xic_exp = true;
+		}
+		
+		// Change xicxss
+		if (pname == "-xicxss" || pname == "-calibration-xicxss")
+		{
+			calibration_xicxss = atof(args[argi]);
+			argi++;
+		}
+
+		/* INPUT SCALING */
+
+		if(pname.compare("-scale") == 0)
+		{
+			scaleValues.clear();
+			argi = read_input_list(&scaleValues, args, argi, nargs);
+			scale_exp = true;
+
+		}
+		
+		if (pname.compare("-sb") == 0 || pname.compare("-scale-back") == 0)
+		{
+			scale_back = 1;
+			scale_back_name = "yes";
+		}
+		
+		// Show help
+		if(pname.compare(std::string("-help")) == 0)
+		{
+			showHelp();	
+			argi++;
+		}
+		
+		if(pname.compare(std::string("-infsr")) == 0)
+		{
+			infsr_exp = true;
+			infsr = atof(args[argi]);
+			argi++;
+		}
+		/*if(pname.compare(std::string("scale")) == 0)
+		{
+			scale = atof(args[argi]);
+			argi++;
+		}*/
+		if(pname.compare(std::string("-cutoff")) == 0)
+		{
+			cutoff = atof(args[argi]);
+			argi++;
+		}
+		if(pname.compare(std::string("-lm")) == 0 || pname.compare(std::string("-local-measure")) == 0 || pname == "-local_measure" || pname == "-lmker" || pname == "local-measure-kernel")
+		{
+			std::string temp = std::string(args[argi]);
+			argi ++;
+
+			if(temp.compare(std::string("max")) == 0)
+			{
+				local_measure = LM_MAX;
+				local_measure_exp = 1;
+				sr_ref = 0.48;
+			}
+			if(temp.compare(std::string("mean")) == 0)
+			{
+				local_measure = LM_MEAN;
+				local_measure_exp = 1;
+				sr_ref = 0.33;
+			}
+			if(temp.compare(std::string("stdev")) == 0)
+			{
+				local_measure = LM_STDEV;
+				local_measure_exp = 1;
+				sr_ref = 0.35;
+			}else
+			{
+				argi--;
+			}
+		}
+		
+		if(pname == "-lweights" || pname == "-lw" || pname == "-local-weights")
+		{
+				std::string option = std::string(args[argi]);				
+				argi++;
+				
+				if(option == "circle")
+				{
+					lweights = W_CIRCLE;
+					lweights_exp = true;
+				}
+				if(option == "gaussian")
+				{
+					lweights = W_GAUSSIAN;
+					lweights_exp = true;
+				}
+				if(option == "none" || option == "box" || option == "constant")
+				{
+					lweights_exp = true;
+					lweights = W_BOX;
+				}
+				else
+				{
+					argi --;
+				}
+		}
+		
+		if(pname == "-lweights-s" || pname == "-lws" || pname == "-local-weights-sigma" || pname == "-lw-sigma")
+		{
+			if(sl_mod)
+			{
+				sl = atof(args[argi]);
+				sl_exp = 1;
+			}
+			argi ++;
+		}
+		// Regularization for local measure
+		if( lmreg_ker_mod && ( pname.compare("-lmreg-ker") == 0 || pname.compare("-lm-reg") == 0 || pname.compare("-lm-reg-ker") == 0|| pname.compare("-lmregker") == 0 || pname == "-lmreg" ) )
+		{
+			std::string temp = std::string(args[argi]);
+			argi++;
+			
+			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0 || temp.compare("no") == 0)
+			{
+				lmreg_ker = KER_NONE;
+				lmreg_s = 0;
+				lmreg_ker_exp = 1;
+			}else
+			if(temp.compare(std::string("gaussian")) == 0){
+				lmreg_ker = KER_GAUSSIAN;
+				lmreg_ker_exp = 1;
+				
+			} else
+			if(temp.compare(std::string("tukey")) == 0) {
+				lmreg_ker = KER_TUKEY;
+				lmreg_ker_exp = 1;
+			} else
+			if(temp.compare(std::string("box")) == 0) {
+				lmreg_ker = KER_BOX;
+				lmreg_ker_exp = 1;
+			}
+			else
+			{
+				argi--;
+			}
+		}
+		// sigma value for local measure regularization
+		if(pname.compare("-lm-reg-s") == 0 || pname.compare("-lmreg-s") == 0 || pname.compare("-lmregs") == 0 || pname.compare("-lmreg-sigma") == 0 || pname.compare("-local-measure-reg-sigma") == 0 || pname.compare("-local-measure-reg-s") == 0 || pname == "-ls" || pname == "-sl")
+		{
+			// If we have not set kernel, gaussian by default
+			if(lmreg_ker_exp == 0)
+			{
+				lmreg_ker = KER_GAUSSIAN;
+			}
+			lmreg_s = atof(args[argi]);
+			lmreg_s_exp = true;
+			argi++;
+		}
+
+		if(pname.compare(std::string("-sm")) == 0)
+		{
+			if(sm_mod)
+				sm = atof(args[argi]);
+			argi ++;
+		}
+	
+		// Check for adaptive
+		if(adaptive_mod && (pname.compare("-adaptive") == 0 || pname.compare("-a") == 0))
+		{
+			adaptive = 1;
+			adaptive_exp = 1;
+		}
+		if(pname.compare("-no-adaptive") == 0 || pname.compare("-adaptive-no") == 0)
+		{
+			adaptive = 0;
+			adaptive_exp = 1;
+		}
+		// debug
+
+		if(pname.compare("-d") == 0 || pname.compare("-debug") == 0)
+			debug = 1;
+
+		// Spatial Kernel
+		if(sker_mod && (pname.compare("-sker") == 0 || pname.compare(std::string("-spatial-kernel")) == 0 || pname.compare("-spatial") == 0 || pname.compare("-spatialocal_measure") == 0 || pname.compare("-spatial-ker") == 0) || pname.compare("-ssker") == 0 )
+		{
+			std::string temp = std::string(args[argi]);
+			argi ++;
+	
+			if(temp.compare(std::string("gaussian")) == 0){
+				
+				sker = KER_GAUSSIAN;
+				sker_exp = 1;
+				
+			} else
+			if(temp.compare(std::string("tukey")) == 0) {	
+				sker_exp = 1;
+				sker = KER_TUKEY;		
+				
+			} else
+			if(temp.compare(std::string("box")) == 0) {	
+				sker_exp = 1;
+				sker = KER_BOX;
+			} else
+			if(temp.compare(std::string("lorentz")) == 0) {
+				sker_exp = 1;
+				sker = KER_LORENTZ;
+
+			}
+			else if(temp == "hamming-sinc" || temp == "hsinc")
+			{
+				sker_exp =1;
+				sker = KER_HSINC;
+				M = atof(args[argi]);
+				argi --;
+
+			}
+			else if(temp.compare(std::string("sinc")) == 0)
+			{
+				sker_exp = 1;
+				sker = KER_SINC;
+				M = atof(args[argi]);
+				argi --;
+				
+			}
+			else if(temp.compare("delta") == 0)
+			{
+				sker_exp = 1;
+				sker = KER_DELTA;
+			}
+			else{
+				argi --;
+			}
+			
+		}
+
+		// Range kernel
+		if(rker_mod && ( pname.compare(std::string("-rker")) == 0 || pname.compare(std::string("-intensity-kernel")) == 0 || pname.compare(std::string("-range-kernel")) == 0 || pname.compare("-range") == 0 ))
+		{	
+			
+			std::string temp = std::string(args[argi]);
+			argi ++;
+			
+			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0){	
+				rker = KER_NONE;
+				
+				srValues.clear();
+				srValues.push_back(0.0f);
+				
+				rker_exp = 1;
+			} else
+	
+			if(temp.compare(std::string("gaussian")) == 0){	
+				rker = KER_GAUSSIAN; 			
+				rker_exp = 1;
+			} else
+			if(temp.compare(std::string("tukey")) == 0) {	
+				rker = KER_TUKEY;			
+				rker_exp = 1;
+			} else
+			if(temp.compare(std::string("box")) == 0) {		
+				rker = KER_BOX;
+				rker_exp = 1;
+			} else 
+			if(temp.compare(std::string("lorentz")) == 0) {
+				rker = KER_LORENTZ;
+				rker_exp = 1;
+			}
+			else {
+				argi --;
+			}
+			
+		}
+	
+		// Check for Regularization Kernel
+		if(regker_mod && (pname.compare(std::string("-regker")) == 0 || pname.compare(std::string("-reg-kernel")) == 0 || pname.compare("-reg") == 0 || pname.compare("-regularization-kernel") == 0 ))
+		{
+			
+			// Regularization kernel
+			std::string temp = std::string(args[argi]);
+			argi ++;
+			
+			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0 || temp.compare("no") == 0)
+			{
+				regker = KER_NONE;
+				sreg = 0;
+				regker_exp = 1;
+			}else
+	
+			if(temp.compare(std::string("gaussian")) == 0){
+				regker = KER_GAUSSIAN;
+				regker_exp = 1;
+			} else
+			if(temp.compare("tukey") == 0)
+			{
+				regker = KER_TUKEY;
+				regker_exp = 1;
+			} else
+			if(temp.compare(std::string("box")) == 0) {
+				regker = KER_BOX;
+				regker_exp = 1;
+			} else
+			{
+				argi--;
+			}
+			
+		}
+		
+		if(pname.compare(std::string("-mker")) == 0 && mker_mod)
+		{
+			std::string temp = std::string(args[argi]);
+			argi ++;
+
+			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0)
+			{
+				mker = KER_NONE;
+				sm = 0;				
+				mker_exp = 1;
+			}
+			if(temp.compare(std::string("gaussian")) == 0)
+			{
+				mker = KER_GAUSSIAN;
+				mker_exp = 1;
+			} else
+			if(temp.compare(std::string("tukey")) == 0)
+			{
+				mker = KER_TUKEY;				
+				mker_exp = 1;
+			} else
+			if(temp.compare(std::string("box")) == 0)
+			{
+				mker = KER_BOX;				
+				mker_exp = 1;
+			} else
+			if(temp.compare(std::string("lorentz")) == 0)
+			{
+				mker = KER_LORENTZ;
+				
+				mker_exp = 1;
+			} else
+			{
+				argi--;
+			}
 		}
  
 	}
@@ -1534,7 +1540,7 @@ int main(int nargs, char** args){
 	}
 
 	
-	// ******************* PARAMETERS ********************************************************************8
+	// ******************* ARRGF PARAMETERS ********************************************************************8
 	// If ss or sr values are missing, complete with zeros
 	if(ssValues.size() == 0)
 	{
@@ -1573,7 +1579,7 @@ int main(int nargs, char** args){
 		time_t now = time(0);		
 		char* dt = ctime(&now);		
 		if(debug) printf("Time: %s\n", dt);
-		log_file_name = output_name + std::string(" - ") + conf_name + std::string(" - LOG - ") + std::string(dt) + std::string(".md");
+		log_file_name = output_name + std::string(" - ") + get_conf_name(conf) + std::string(" - LOG - ") + std::string(dt) + std::string(".md");
 		if(debug) dprintf(0, "Log file output: %s\n", log_file_name.data());
 	}
 		
@@ -1598,8 +1604,8 @@ int main(int nargs, char** args){
 	// ************************************ INFORM PARAMETERS TO USER *************************************************
 	// *****************************************************************************************************************
 
-	printf("\n\nALGORITHM:\t%s\n", conf_name.data());
-	if (save_log) fprintf(log_file, "\nALGORITHM CONFIGURATION:\t%s (%i)\n", conf_name.data(), conf);
+	printf("\n\nALGORITHM:\t%s\n", get_conf_name(conf).data());
+	if (save_log) fprintf(log_file, "\nALGORITHM CONFIGURATION:\t%s (%i)\n", get_conf_name(conf).data(), conf);
 	
 	printf("\nPARAMETERS:\n");
 	
@@ -1621,8 +1627,8 @@ int main(int nargs, char** args){
 	printf("Output image prefix: %s\n", output_name.data());
 	if (save_log) fprintf(log_file, "Output image: %s\n", output_name.data());
 	
-	printf("\nSpatial kernel:\t %s", sker_name.data());
-	if(save_log) fprintf(log_file, "\nSpatial kernel:\t %s", sker_name.data());
+	printf("\nSpatial kernel:\t %s", get_ker_name(sker).data());
+	if(save_log) fprintf(log_file, "\nSpatial kernel:\t %s", get_ker_name(sker).data());
 	
 	printf("\n\tss values: \t"); printfVector(ssValues); printf("\n");
 	if(save_log)
@@ -1632,8 +1638,8 @@ int main(int nargs, char** args){
 		fprintf(log_file, "\n");
 	}
 
-	printf("\nRegularization kernel:\t %s\n", regker_name.data());
-	if(save_log) fprintf(log_file, "Regularization kernel:\t %s", regker_name.data());
+	printf("\nRegularization kernel:\t %s\n", get_ker_name(regker).data());
+	if(save_log) fprintf(log_file, "Regularization kernel:\t %s", get_ker_name(regker).data());
 
 	printf("\tsreg values: \t"); printfVector(sregValues); printf("\n");
 	if(save_log)
@@ -1643,8 +1649,8 @@ int main(int nargs, char** args){
 		fprintf(log_file, "\n");
 	}
 	
-	printf("\nRange kernel:\t %s", rker_name.data());
-	if (save_log) fprintf(log_file, "Range kernel:\t %s", rker_name.data());
+	printf("\nRange kernel:\t %s", get_ker_name(rker).data());
+	if (save_log) fprintf(log_file, "Range kernel:\t %s", get_ker_name(rker).data());
 	
 	printf("\n\tsr values: \t"); printfVector(srValues); printf("\n");
 	if(save_log)
@@ -1673,15 +1679,15 @@ int main(int nargs, char** args){
 	
 	if(adaptive)
 	{
-		printf("\tLocal Measure:\t %s", local_measure_name.data());
-		if (save_log) fprintf(log_file, "\tLocal measure calculation kernel for adaptiveness:\t %s\n", local_measure_name.data());
+		printf("\tLocal Measure:\t %s", get_lm_name(local_measure).data());
+		if (save_log) fprintf(log_file, "\tLocal measure calculation kernel for adaptiveness:\t %s\n", get_lm_name(local_measure).data());
 		if(!sl_exp)
-			printf("\n\tLocal measure weights:\t%s, sl = auto\n", lweights_name.data());
+			printf("\n\tLocal measure weights:\t%s, sl = auto\n", get_w_name(lweights).data());
 		else
-			printf("\n\tLocal measure weights: \t%s, sl = %f", lweights_name.data(), sl);
-		if (save_log) fprintf(log_file, "\tLocal measure weights:\t%s, sl = %.4f\n", lweights_name.data(), sl);
-		printf("\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", lmreg_ker_name.data(), lmreg_s);
-		if (save_log) fprintf(log_file, "\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", lmreg_ker_name.data(), lmreg_s);
+			printf("\n\tLocal measure weights: \t%s, sl = %f", get_w_name(lweights).data(), sl);
+		if (save_log) fprintf(log_file, "\tLocal measure weights:\t%s, sl = %.4f\n", get_w_name(lweights).data(), sl);
+		printf("\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
+		if (save_log) fprintf(log_file, "\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
 	}
 	//printf("Median kernel:\t %s, ms = %.4f\n", mker_name.data(), sm);	
 	// if we are not spedified iterations to print, just last one
@@ -1986,7 +1992,7 @@ int main(int nargs, char** args){
 	// ******************************************************************************************************************************
 	
 	bool print_it = false; // True if iteration is to be printed	
-	output_name = output_name + "-" + conf_name;
+	output_name = output_name + "-" + get_conf_name(conf);
 	
 	// LOOPS:
 	if(debug) dprintf(0, "Starting SCALEloop \n");
@@ -2156,7 +2162,7 @@ int main(int nargs, char** args){
 		if(save_log) fprintf(log_file, "\n\n\tWorking for ss = %.2f, sr = %.2f, scale = %.2f\n", ss, sr, scale);
 		
 		//Initialize dev_g according to conf
-		if(debug) dprintf(0, "\nIntializing dev_g in device for conf %s (%i) (copying from g_host)... ", conf_name.data(), conf);
+		if(debug) dprintf(0, "\nIntializing dev_g in device (copying from g_host)... ");
 		cudaMemcpy(dev_g, host_g, nch_no_alpha * H * W * sizeof(type), cudaMemcpyHostToDevice);				
 		if(debug) dprintf(0, "done.");	
 	
@@ -2462,7 +2468,7 @@ int main(int nargs, char** args){
 
 				if(rker_exp)
 				{
-					out_name += "-rker-" + rker_name;
+					out_name += "-rker-" + get_ker_name(rker);
 				}
 				if(sr > 0)
 				{
@@ -2470,7 +2476,7 @@ int main(int nargs, char** args){
 				}
 				if(sker_exp)
 				{
-					out_name += "-sker-" + sker_name;
+					out_name += "-sker-" + get_ker_name(sker);
 				}		
 				if(ss > 0)
 				{
@@ -2487,12 +2493,12 @@ int main(int nargs, char** args){
 				// Add Adaptive Filter info
 				if (adaptive)
 				{
-					out_name += "-lm_" + local_measure_name;
-					out_name += "_" + lweights_name + "_" + Patch::to_string_f(sl, 2);
+					out_name += "-lm_" + get_lm_name(local_measure);
+					out_name += "_" + get_w_name(lweights) + "_" + Patch::to_string_f(sl, 2);
 				
 					if(lmreg_ker_exp)
 					{
-						out_name += "-lmreg_" + lmreg_ker_name + "_" + Patch::to_string_f(lmreg_s, 2);
+						out_name += "-lmreg_" + get_ker_name(lmreg_ker) + "_" + Patch::to_string_f(lmreg_s, 2);
 					}
 				}
 				
