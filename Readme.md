@@ -5,7 +5,7 @@
 This implements Adaptive Regularized RGF filter for 8 bit .png images.
 It uses CPU and GPU using .cu files.
 
-**Compile and test:**
+**Compile and test in Ubuntu:**
 ```
 sh test.sh
 ```
@@ -18,7 +18,7 @@ cd build
 cmake ../
 make
 ```
-This compiles and creates ./arrgf.out executable in build/ directory
+This compiles and creates `./arrgf.out` executable in `build/` directory
 
 **Run program:**
 ```
