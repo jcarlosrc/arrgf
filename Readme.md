@@ -1,6 +1,6 @@
 # ARRGF basic implementation
 
-## Readme
+## About
 
 This implements Adaptive Regularized RGF filter for 8 bit .png images.
 It uses CPU and GPU using .cu files.
@@ -9,7 +9,7 @@ It uses CPU and GPU using .cu files.
 ```
 sh test.sh
 ```
-This will create build and test-output directories to compile and test the program.
+This will create `build/` and `test-output/` directories to compile and test the program respectively.
 
 **Compilation only:**
 ```
@@ -27,10 +27,10 @@ This compiles and creates ./arrgf.out executable in build/ directory
 
 **Example:**
 ```
-./arrgf.out -input barbara -output -test-output/barbara -arrgf -ss 3.0 and 4.0 -sr 0.03 and 0.1 -print-it 3 and 5 : 10<br/>
+./arrgf.out -input barbara -output -test-output/barbara -arrgf -ss 3.0 and 4.0 -sr 0.03 and 0.1 -print-it 3 and 5 : 10
 ```
 
 **More info:**
 ```
-./arrgf.out -help<br/>
+./arrgf.out -help
 ```
