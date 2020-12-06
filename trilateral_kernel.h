@@ -1,7 +1,9 @@
 //type infval = 0.0010;
 #define PI 3.141592;
-//Kernel with RGB distance calculation, NOT shared memory, vector sr
-template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, type* out, int nchannels, int H, int W, type ss, type sr, type* srvec, type infsr, type sm, int stype, int itype, int mtype, int kh, int kw){
+#define macro_get_val(f, i, j, c, H, W)	((i > -1 && i < H && j > -1 && j < W) ? f[i * W + j + c * H * W] : 0.0f)
+
+//Kernel with RGB distance calculation, NOT shared memory, vector sr. f is single channel, g can be rgb, out is single channel
+template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, type* out, int nchannels, int H, int W, int domain_extension, type ss, type sr, type* srvec, type infsr, type sm, int stype, int itype, int mtype, int kh, int kw){
 	//Position of block in image
 	int bi = blockIdx.y * blockDim.y + threadIdx.y;
 	int bj = blockIdx.x * blockDim.x + threadIdx.x;
@@ -33,14 +35,25 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 		type den = 0;
 		for(int di = -kh; di<=kh; di++){
 			for(int dj = -kw; dj<=kw; dj++){
+				int a, b, e;
 
-				//Extension to image positions
-				int e = 2 * max((int) (W/kw) + 1, (int) (H / kh) + 1);
-				int a = (di + bi + e * 2*H)%(2*H) ;
-				int b = (dj + bj + e * 2*W)%(2*W) ;
-				
-				if(a > H-1) a = 2*H-a-1;
-				if(b > W-1) b = 2*W-b-1;
+				switch (domain_extension)
+				{
+				case 0:
+					a = bi + di; b = bj + dj;
+					break;
+				case 1:
+					e = 2 * max((int) (W/kw) + 1, (int) (H / kh) + 1);
+					a = (di + bi + e * 2*H)%(2*H) ;
+					b = (dj + bj + e * 2*W)%(2*W) ;
+					
+					if(a > H-1) a = 2*H-a-1;
+					if(b > W-1) b = 2*W-b-1;
+					break;
+				default:
+					a = bi + di; b = bj + dj;
+					break;
+				}
 				
 				type temp = 1.0f;
 				// Apply spatial kernel
@@ -104,7 +117,8 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 					type norm2 = 0;
 					for(int c = 0; c < nchannels; c++)
 					{
-						type temp =  g[a * W + b + c * H * W] - g[(bi) * W + bj + c * H * W];
+						type temp = macro_get_val(g, a, b, c, H, W) - macro_get_val(g, bi, bj, c, H, W);
+						//type temp =  g[a * W + b + c * H * W] - g[(bi) * W + bj + c * H * W];
 						norm2+= temp * temp;
 					}
 					//norm2 = norm2 / ((type)nchannels * (type) nchannels);
@@ -135,7 +149,8 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 					type norm2 = 0;
 					for(int c = 0; c < nchannels; c++)
 					{
-						type temp =  f[a * W + b + c * H * W] - g[a * W + b + c * H * W];
+						type temp = macro_get_val(f,a, b, 0, H, W) - macro_get_val(g, a, b, c , H, W);
+						//type temp =  f[a * W + b + c * H * W] - g[a * W + b + c * H * W];
 						norm2 += temp * temp;
 					}
 					norm2 = norm2 / ((type)nchannels);
@@ -158,7 +173,7 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 					}
 				}
 				
-				num += temp * f[a * W + b];
+				num += temp * macro_get_val(f, a, b, 0, H, W);
 				den += temp;
 			}		
 		}
@@ -168,7 +183,7 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 }
 
 //Kernel with RGB distance calculation, NOT shared memory, single sr
-template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, type* out, int nchannels, int H, int W, type ss, type sr, type sm, int stype, int itype, int mtype, int kh, int kw){
+template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, type* out, int nchannels, int H, int W, int domain_extension, type ss, type sr, type sm, int stype, int itype, int mtype, int kh, int kw){
 	
 	//Position of block in image
 	int bi = blockIdx.y * blockDim.y + threadIdx.y;
@@ -183,13 +198,28 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 		for(int di = -kh; di <= kh; di++){
 			for(int dj = -kw; dj <= kw; dj++){
 				// extend image enough to fit posibly large kh and kw
-				int e = 2;//2 * max((int) (W/kw) + 1, (int) (H / kh) + 1);
+				//2 * max((int) (W/kw) + 1, (int) (H / kh) + 1);
 				//Extension to image positions
-				int a = (di + bi + e * 2*H)%(2*H) ;
-				int b = (dj + bj + e * 2*W)%(2*W) ;
-				
-				if(a > H-1) a = 2*H-a-1;
-				if(b > W-1) b = 2*W-b-1;
+				int a, b, e;
+				switch (domain_extension)
+				{
+				case 0:
+					a = bi + di;
+					b = bj + dj;
+					break;
+				case 1:
+					e = 2 * max((int) (W/kw) + 1, (int) (H / kh) + 1);
+					a = (di + bi + e * 2*H)%(2*H) ;
+					b = (dj + bj + e * 2*W)%(2*W) ;
+					
+					if(a > H-1) a = 2*H-a-1;
+					if(b > W-1) b = 2*W-b-1;
+					break;
+				default:
+					a = bi + di;
+					b = bj + dj;
+					break;
+				}
 				
 				type temp = 1.0f;
 				// Apply spatial kernel
@@ -254,7 +284,8 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 					type norm = 0;
 					for(int c = 0; c < nchannels; c++)
 					{
-						type temp =  g[a * W + b + c * H * W] - g[(bi) * W + bj + c * H * W];
+						//type temp =  g[a * W + b + c * H * W] - g[(bi) * W + bj + c * H * W];
+						type temp = macro_get_val(g, a, b, c, H, W) - macro_get_val(g, bi, bj, c, H, W);
 						norm += temp * temp;
 					}
 					norm = norm / ((type)nchannels);
@@ -285,7 +316,8 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 					type norm = 0;
 					for(int c = 0; c < nchannels; c++)
 					{
-						type temp =  f[a * W + b + c * H * W] - g[a * W + b + c * H * W];
+						//type temp =  f[a * W + b] - g[a * W + b + c * H * W];
+						type temp = macro_get_val(f, a, b, 0, H, W) - macro_get_val(g, a, b, c, H, W);
 						norm += temp * temp;
 					}
 					norm = norm / ((type)nchannels);
@@ -308,211 +340,12 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 					}
 				}
 				
-				num += temp * f[a * W + b];
+				//num += temp * f[a * W + b];
+				num += temp * macro_get_val(f, a, b, 0, H, W);
 				den += temp;
 			}		
 		}
 
-		out [(bi) * W + bj] = num / den;
-	}
-}
-
-
-//Kernel for single channel, NOT shared memory, vector sr
-template<typename type> __global__ void trilateral_kernel_single(type* f, type* g, type* out, int H, int W, type ss, type sr, type sm, type* srvec, type infsr, int stype, int itype, int mtype, int kh, int kw){
-	
-	//Position of block in image
-	int bi = blockIdx.y * blockDim.y + threadIdx.y;
-	int bj = blockIdx.x * blockDim.x + threadIdx.x;
-
-	//Calculate pixel values
-	if(bi < H && bj < W){
-		type auxsr = max(infsr, sr * srvec[(bi) * W + bj]);
-		//type auxsm = max(infval, sm * srvec[(bi) * W + bj]);
-		type auxsm = sm;
-		type num = 0; 
-		type den = 0;
-		for(int di = -kh; di<=kh; di++){
-			for(int dj = -kw; dj<=kw; dj++){
-				type temp = 1.0f;
-				// Apply spatial kernel
-				if(ss>0){
-					type dist2= (type)(di * di + dj * dj);
-					switch (stype){
-					case 0:	// gaussian
-						temp *= exp(-0.5f * dist2/ss/ss);
-						break;
-					case 1:	// tukey
-						temp *= max(0.0f, 1.0f-dist2/ ss /ss) * max(0.0f, 1.0f-dist2/ ss /ss);
-						break;
-					case 2:
-						if(ss * ss < dist2)temp = 0;
-						break;
-					case 3:
-						temp *= 1.0f / (1.0f + dist2/ ss / ss);
-						break;
-					default:
-						break;
-					}
-				}
-				//Extension to image positions
-				int a = (di + bi + 2*H)%(2*H) ;
-				int b = (dj + bj + 2*W)%(2*W) ;
-				
-				if(a > H-1) a = 2*H-a-1;
-				if(b > W-1) b = 2*W-b-1;
-				
-				if(sr > 0)
-				{
-					//RGB distance, sums over all channels
-					type norm = g[a * W + b ] - g[(bi) * W + bj ];
-					norm *= norm;
-					
-					switch (itype){
-					case 0:
-						temp *= exp(-0.5f * norm /auxsr/auxsr);
-						break;
-					case 1:
-						temp *= max(0.0f, 1.0f-norm/ auxsr /auxsr) * max(0.0f, 1.0f-norm / auxsr /auxsr);
-						break;
-					case 2:
-						if(auxsr * auxsr < norm)
-							temp = 0.0f;
-						break;
-					case 3:
-						temp *= 1.0f / (1.0f + norm / auxsr / auxsr);
-						break;
-					default:
-						break;
-					}
-				}
-				
-				
-				//RGB distance, sums over all channels
-				if(sm > 0){
-					type norm =  f[a * W + b ] - g[a * W + b ];
-					norm *= norm;
-					
-					switch (mtype){
-					case 0:
-						temp *= exp(-0.5f  * norm /auxsm/auxsm );
-						break;
-					case 1:
-						temp *= max(0.0f, 1.0f- norm/auxsm/auxsm) * max(0.0f, 1.0f - norm / auxsm/auxsm);
-						break;
-					case 2:
-						if(sm * sm < norm) temp = 0.0f;
-						break;
-					case 3:
-						temp *= 1.0f / (1.0f + norm / auxsm / auxsm);
-						break;
-					default:
-						break;
-					}
-				}
-				num += temp * f[a * W + b];
-				den += temp;
-			}		
-		}
-	
-		out [(bi) * W + bj] = num / den;
-	}
-}
-
-//Kernel for single channel, NOT shared memory, single sr
-template<typename type> __global__ void trilateral_kernel_single(type* f, type* g, type* out, int H, int W, type ss, type sr, type sm, int stype, int itype, int mtype, int kh, int kw){
-	
-	//Position of block in image
-	int bi = blockIdx.y * blockDim.y + threadIdx.y;
-	int bj = blockIdx.x * blockDim.x + threadIdx.x;
-
-	//Calculate pixel values
-	if(bi < H && bj < W){
-		type num = 0; 
-		type den = 0;
-		for(int di = -kh; di<=kh; di++){
-			for(int dj = -kw; dj<=kw; dj++){
-				type temp = 1.0f;
-				// Apply spatial kernel
-				if(ss>0){
-					type dist2= (type)(di * di + dj * dj);
-					switch (stype){
-					case 0:	// gaussian
-						temp *= exp(-0.5f * dist2/ss/ss);
-						break;
-					case 1:	// tukey
-						temp *= max(0.0f, 1.0f-dist2/ ss /ss) * max(0.0f, 1.0f-dist2/ ss /ss);
-						break;
-					case 2:
-						if(ss * ss < dist2)temp = 0;
-						break;
-					case 3:
-						temp *= 1.0f / (1.0f + dist2/ ss / ss);
-						break;
-					default:
-						break;
-					}
-				}
-				//Extension to image positions
-				int a = (di + bi + 2*H)%(2*H) ;
-				int b = (dj + bj + 2*W)%(2*W) ;
-				
-				if(a > H-1) a = 2*H-a-1;
-				if(b > W-1) b = 2*W-b-1;
-				
-				if(sr > 0)
-				{
-					//RGB distance, sums over all channels
-					type norm = g[a * W + b ] - g[(bi) * W + bj ];
-					norm *= norm;
-					
-					switch (itype){
-					case 0:
-						temp *= exp(-0.5f * norm /sr/sr);
-						break;
-					case 1:
-						temp *= max(0.0f, 1.0f-norm/ sr /sr) * max(0.0f, 1.0f-norm / sr /sr);
-						break;
-					case 2:
-						if(sr * sr < norm)
-							temp = 0.0f;
-						break;
-					case 3:
-						temp *= 1.0f / (1.0f + norm / sr / sr);
-						break;
-					default:
-						break;
-					}
-				}
-				
-				
-				//RGB distance, sums over all channels
-				if(sm > 0){
-					type norm = f[a * W + b ] - g[a * W + b ];
-					norm *= norm;
-					
-					switch (mtype){
-					case 0:
-						temp *= exp(-0.5f  * norm /sm/sm );
-						break;
-					case 1:
-						temp *= max(0.0f, 1.0f- norm/sm/sm) * max(0.0f, 1.0f - norm / sm/sm);
-						break;
-					case 2:
-						if(sm * sm < norm) temp = 0.0f;
-						break;
-					case 3:
-						temp *= 1.0f / (1.0f + norm / sm / sm);
-						break;
-					default:
-						break;
-					}
-				}
-				num += temp * f[a * W + b];
-				den += temp;
-			}		
-		}
-	
 		out [(bi) * W + bj] = num / den;
 	}
 }
@@ -520,10 +353,6 @@ template<typename type> __global__ void trilateral_kernel_single(type* f, type* 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///////////////// //                       Using shared memory, not ready.              ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-
 
 
 //Bilateral kernel.

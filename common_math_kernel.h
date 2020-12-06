@@ -1,3 +1,6 @@
+#define PASS_TYPE_ROWS 0
+#define PASS_TYPE_COLS 1
+
 template<typename type> __global__ void set_const_kernel(type *a, int H, int W, type val){
 	//Position of block in image
 	int i = blockIdx.y * blockDim.y + threadIdx.y;
@@ -18,6 +21,17 @@ template<typename type> __global__ void scale_kernel(type *a, type *out, type sc
 	{
 		out[k] = scale * a[k];
 
+	}
+}
+
+template<typename type> __global__ void scale_kernel(type *a, type *out, type scale, int lenght)
+{
+	//Position of block in array
+	int k =  blockIdx.x * blockDim.x + threadIdx.x;
+	
+	if(-1 < k && k < lenght)
+	{
+		out[k] = scale * a[k];
 	}
 }
 
@@ -140,4 +154,36 @@ template<typename type> __global__ void add_kernel(type *a_single , type* b_sing
 	int k = i * W + j;
 	if(i < H && j < W)
 		out_single[k] = a_single[k] + b_single[k];
+}
+
+// Log for single channel image
+/*template<typename type> __global__ void log_kernel(type *input, type *output, int H, int W)
+{
+	//Position of block in image
+	int i = blockIdx.y * blockDim.y + threadIdx.y;
+	int j =  blockIdx.x * blockDim.x + threadIdx.x;
+	int k = i * W + j;
+	if(i < H && j < W)
+		output[k] = (input[k] >0) ? log(input[k]) : log(-input[k]);
+}
+*/
+template<typename type> __global__ void log_kernel(type *input, type *output, int lenght, float eps = 0.001)
+{
+	//Position of block in image
+	//int i = blockIdx.y * blockDim.y + threadIdx.y;
+	int k =  blockIdx.x * blockDim.x + threadIdx.x;
+	if(-1 < k && k < lenght){
+		output[k] = (input[k] + eps >0) ? log(input[k]) : log(-input[k]);
+	}
+}
+
+template<typename type> __global__ void gammify_kernel(type *in_single, type *out_single, int H, int W, int pass_type = PASS_TYPE_ROWS)
+{
+	//Position of block in image
+	int i = blockIdx.y * blockDim.y + threadIdx.y;
+	int j =  blockIdx.x * blockDim.x + threadIdx.x;
+	int k = i * W + j;
+	if(i < H && j < W)
+		out_single[k] = ( in_single[k] <= 0.0031308) ? 12.92 * in_single[k] : 1.055 * pow( in_single[k], 1.0/2.4 ) - 0.055;
+		//output[k] = (input[k] >0) ? log(input[k]) : log(-input[k]);
 }

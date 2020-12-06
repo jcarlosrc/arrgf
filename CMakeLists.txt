@@ -9,5 +9,5 @@ SET(CMAKE_CXX_STANDARD 11)
 CUDA_ADD_EXECUTABLE(hello.out hello.cu)
 CUDA_ADD_EXECUTABLE(get-cuda-info.out get_cuda_info.cu)
 
-CUDA_ADD_EXECUTABLE(arrgf.out arrgf.cu png_tool.cpp)
+CUDA_ADD_EXECUTABLE(arrgf.out arrgf.cu)
 TARGET_LINK_LIBRARIES(arrgf.out ${PNG_LIBRARY})

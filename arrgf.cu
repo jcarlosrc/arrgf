@@ -1,27 +1,30 @@
-//Cuda implementation of the RRGF filter
+// Cuda implementation of the RRGF filter
 #include<algorithm>
 #include <stdio.h>
 #include <math.h>
 #include <chrono>
 
-#include "png_tool.hpp"
+#include "png_tool.h"
 #include <string>
 #include <vector>
 #include <ctime>
 
 // RGBE support from https://www.graphics.cornell.edu/~bjw/rgbe.html
-#include "rgbe.h"
+/*extern "C"
+{
+	#include "rgbe.h"
+}*/
+// HDR loading support from Igor Kravtchenko github
+#include "hdrloader.h" 
 
 #include "convolution_kernel.h"
-//#include "bilateral_kernel.h"
-//#include "stddev_kernel.h"
 #include "common_math_kernel.h"
-#include "patch.hpp"
+#include "patch.h"
 #include "local_measure.h"
 #include "trilateral_kernel.h"
 #include "rgbnorm2_kernel.h"
 #include "l2loc2_kernel.h"
-#include "vec_util.h"
+#include "matrix.h"
 #include "util.h"
 
 // Include color space conversion
@@ -33,15 +36,32 @@
 
 //Data type to use for images and images in kernels
 #define type float
+//typename type = float;
 
 #ifndef CTE255
 #define CTE255 255.0f
 #endif
 
-// --- Input types
-#define IMAGE_RGBA 0 // (.hdr)
-#define IMAGE_HDR 1	// (.png)
-#define IMAGE_GRAY16 2	// (.png)
+#define IMAGE_PNG 0
+#define IMAGE_HDR 1
+#define IMAGE_TXT 2
+
+std::string get_im_format(int format)
+{
+	switch(format)
+	{
+		case 0:
+		return ".png";
+		break;
+
+		case 1:
+		return ".hdr";
+		break;
+
+		default:
+		return ".";
+	}
+}
 
 // kernels
 #define KER_NONE -1
@@ -141,6 +161,10 @@ std::string get_w_name(int w)
 #define CONF_RRGF 1
 #define CONF_ARRGF 0
 #define CONF_NONE -1
+#define CONF_GAMMIFY 5
+#define CONF_UNGAMMIFY 6
+#define CONF_TONE_MAPPING 7
+#define CONF_TO_GRAY 8
 
 std::string get_conf_name(int conf)
 {
@@ -164,6 +188,18 @@ std::string get_conf_name(int conf)
 		case CONF_CONV:
 			return "Convolution";
 			break;
+		case CONF_GAMMIFY:
+			return "GAMMA";
+			break;
+		case CONF_UNGAMMIFY:
+			return "LINEAR";
+			break;
+		case CONF_TONE_MAPPING:
+			return "TM";
+			break;
+		case CONF_TO_GRAY:
+			return "GRAY";
+			break;
 		default:
 			return "none";
 	}
@@ -184,8 +220,15 @@ int gbsZ = 1;
 /*----------------------  VARIABLES ---------------------------------------------------------------------*/
 // -------------------------------------------------------------------------------------------------------
 
-int input_type = IMAGE_RGBA;	// RGBA png image
-int output_type = IMAGE_RGBA;
+int input_format = IMAGE_PNG;	// png image
+int output_format = IMAGE_PNG;
+
+bool print_alpha_channel = false;
+bool print_input_png = false;
+
+int H, W;	// Input widht and height
+int domain_extension = 0;
+bool domain_extension_exp = false;
 
 int debug = 0;
 std::string debug_name = std::string("no");
@@ -222,11 +265,15 @@ int scale_exp = 0;
 //type scale = 1.0f;
 int scale_back = false;
 std::string scale_back_name = std::string("no");
+type scale;
 
 // Spatial kernel specs
 std::vector<type> ssValues;
 int ss_exp = 0;
 int ss_mod = 1;
+type ss;
+
+type gaussian_neigh = 4.0;
 
 int sker_mod = 1;	// allow modifications?
 int sker_exp = 0;	// is explicitly defined?
@@ -238,6 +285,7 @@ int sskw = 0;
 std::vector<type> srValues;
 int sr_exp = 0;
 int sr_mod = 1;
+type sr;
 
 int rker_mod = 1;
 int rker_exp = 0;
@@ -256,12 +304,15 @@ int regkw = 0;
 int nit = 10;
 int nit_mod = 1;
 int nit_exp = 0;
+int it;
 
 bool print_gamma = false;
 bool gammacor_in = true;
 bool print_linear = false;
 bool gammacor_load_it = true;
 bool gammacor_txt_out = false;	// Txt is saved in linear space. ALWAYS.
+
+bool print_input_txt = false;
 
 int adaptive_mod = 1;
 std::string adaptive_name = "yes";
@@ -304,9 +355,10 @@ int conf_mod = 1;
 int conf_exp = 0;
 int conf = 0; // arrgf by default
 
+// M = support size for sinc and hsinc approximation
 type M = 20;
 
-type infsr = 0.0001;
+type infsr = 1.0e-5;
 bool infsr_exp = false;
 
 int i0 = 10;
@@ -502,11 +554,11 @@ int equal_zeros(type *devx, int n, std::string message = std::string(""))
 }
 
 // Set configuration from configuration name: rgf, rrgf, arrgf, conv
-int set_conf ( std::string conf_string )
+int set_conf ()
 {
-	if(conf_string.compare(std::string("bilateral")) == 0)
+	switch(conf)
 	{
-		conf = CONF_BIL;
+		case CONF_BIL:
 		adaptive = 0; adaptive_mod = 0;
 		regker = KER_NONE; sreg = 0; regker_mod = 0;
 		mker = KER_NONE; sm = 0; mker_mod = 0;
@@ -516,25 +568,17 @@ int set_conf ( std::string conf_string )
 		conf_mod = 0;
 		conf_exp = 1;
 
-		return conf;
-	}
-	if(conf_string.compare(std::string("rgf")) == 0)
-	{
-		conf = CONF_RGF;
+		break;
+	case CONF_RGF:
 		adaptive = 0; adaptive_mod = 0;
 		regker = -1; sreg = 0; regker_mod = 0;
 		mker = KER_NONE; sm = 0; mker_mod = 0;
 		local_measure = -1; sl = 0;  local_measure_mod = 0; sl_mod = 0;
 		if(nit_mod && !nit_exp) nit = 10;
-		
 		conf_mod = 0;
 		conf_exp = 1;
-
-		return conf;
-	}
-	if(conf_string.compare(std::string("rrgf")) == 0)
-	{
-		conf = CONF_RRGF;
+		break;
+	case CONF_RRGF:
 		adaptive = 0; adaptive_mod = 0;
 		mker = KER_NONE; sm = 0;  mker_mod = 0;
 		local_measure = -1; sl = 0; local_measure_mod = 0;
@@ -542,12 +586,9 @@ int set_conf ( std::string conf_string )
 		
 		conf_mod = 0;
 		conf_exp = 1;
-
-		return conf;
-	}
-	if(conf_string.compare(std::string("arrgf")) == 0 )
-	{
-		conf = CONF_ARRGF;
+		break;
+	
+	case CONF_ARRGF:
 		adaptive = 1; adaptive_mod = 0;
 		mker = KER_NONE; sm = 0; mker_mod = 0;
 		if(nit_mod && !nit_exp) nit = 10;
@@ -556,10 +597,8 @@ int set_conf ( std::string conf_string )
 		conf_exp = 1;
 
 		return conf;
-	}
-	if(conf_string.compare(std::string("conv")) == 0 || conf_string.compare(std::string("convolution")) == 0)
-	{
-		conf = CONF_CONV;
+		break;
+	case CONF_CONV:
 		adaptive = 0; adaptive_mod = 0;
 		regker = KER_NONE; sreg = 0; regker_mod = 0;
 		mker = KER_NONE; sm = 0; mker_mod = 0;
@@ -569,31 +608,75 @@ int set_conf ( std::string conf_string )
 		
 		conf_mod = 0;
 		conf_exp = 1;
-
-		return conf;
+		break;
+	default:
+		break;
 	}
 	return conf;
 }
-/*void save_to_grayimage(std::string pngname, type *devx, int H, int W)
-{
-	unsigned int color_type = 1;
-	unsigned int bit_depth = 8;
-	type* hostx = new type[H * W];
-	cudaMemcpy(hostx, devx, H*W*sizeof(type), cudaMemcpyDeviceToHost);	
-	
-	//printf("Copy new data to pixels buffer applying back gamma correction... ");
-	unsigned char* pixels = new unsigned char [H * W];
-	unsigned char* p = pixels;
-	for(int i = 0; i< H*W; i++){
-		*p = (unsigned char)(255.0f * hostx[i]);
-		p++;
-	}
-	save_image(pngname.data(), pixels, H, W, 1, color_type, bit_depth);
-	delete[] pixels;
-	delete[] hostx;
-	//printf("done.\n");
 
-}*/
+void make_output_name(std::string *out_name)
+{
+	// Add adapt_sr info to RGF
+	if(adapt_sr && adaptive == false)
+	{
+		*out_name += "_asr";
+	}
+
+	if(rker_exp)
+	{
+		*out_name += "-rker-" + get_ker_name(rker);
+	}
+	if(sr > 0 )
+	{
+		*out_name += "-sr-" +  Patch::to_string_f(sr, 2);
+	}
+	if(sker_exp)
+	{
+		*out_name += "-sker-" + get_ker_name(sker);
+	}
+	if(xic_exp == false)
+	{
+		*out_name += "-ss-" +  Patch::to_string_f(ss, 2);
+	}
+	else
+	{
+		*out_name += "xic_1_" + Patch::to_string_f(ss / calibration_xicxss,2);
+	}
+	if(sreg_exp) *out_name += "-sreg_" + Patch::to_string_f(sreg, 2);
+	// Add Adaptive Filter info
+	if (adaptive && ss > 0 && local_measure_exp)
+	{
+		*out_name += "-lm_" + get_lm_name(local_measure);
+		*out_name += "_" + get_w_name(lweights) + "_" + Patch::to_string_f(sl, 2);
+	
+		if(lmreg_ker_exp)
+		{
+			*out_name += "-lmreg_" + get_ker_name(lmreg_ker) + "_" + Patch::to_string_f(lmreg_s, 2);
+		}
+	}
+	
+	// Add iteration info
+	*out_name += "-nit-" + Patch::to_string(it);
+
+	// Add scaling info
+	if (scale_exp)
+	{
+		*out_name += "-scale" ;
+		if (scale_back)
+		{
+			*out_name += "_sb";
+		}
+		*out_name += "-" + Patch::to_string_f(scale, 2);
+	}
+	
+	// Add infsr info
+	if(infsr_exp == true)
+	{
+		*out_name += "-infsr_" + Patch::to_string_f(infsr, 2);
+	}
+
+}
 
 //*******************************************************************************
 // Main
@@ -623,7 +706,8 @@ int main(int nargs, char** args){
 			commands_string += " ";
 	}
 	if(debug) printf("Commands entered: %s\n", commands_string.data());
-	// Check parameters
+
+	// Read PARAMETERS
 	int argi = 1;
 	while(argi < nargs)
 	{	
@@ -631,9 +715,26 @@ int main(int nargs, char** args){
 		std::string pname = std::string(args[argi]);
 		argi ++;
 
+		/* GENERAL CONFIGURATIONS */
+		if(pname == "-gauss-neigh" || pname == "-gn" || pname == "-gauss")
+		{
+			gaussian_neigh = atof(args[argi]);
+			argi ++;
+		}
+		if(pname == "-ext-zeros" || pname == "-zeros")
+		{
+			domain_extension = 0;
+			domain_extension_exp = true;
+		}
+		if(pname == "-ext-mirror" || pname == "-mirror")
+		{
+			domain_extension = 1;
+			domain_extension_exp = true;
+		}
+
 		/* INPUT AND OUTPUT TYPES AND SPECS */
 
-		if(pname.compare(std::string("-input")) == 0 || pname.compare(std::string("-in")) == 0)
+		if(pname == "-input" || pname == "-in")
 		{
 			//printf("Input : ");
 			input_name = std::string(args[argi]);
@@ -641,7 +742,7 @@ int main(int nargs, char** args){
 			//printf("%s\n", input_name.data());
 		}
 
-		if(pname.compare(std::string("-output")) == 0 || pname.compare(std::string("-out")) == 0)
+		if(pname == "-output"|| pname == "-out")
 		{
 			//printf("Output: ");
 			output_name = std::string(args[argi]);
@@ -650,17 +751,24 @@ int main(int nargs, char** args){
 			make_output_default = 0;
 			
 		}
-		if(pname == "-hdr-input" || pname == "-input-hdr")
+		if(pname == "-hdr-input" || pname == "-input-hdr" || pname == "-hdr")
 		{
-			input_type = IMAGE_HDR;
+			input_format = IMAGE_HDR;
 		}
 
-		if(pname == "-hdr-tone-mapping" || pname == "-hdrtm")
+		if(pname == "-hdr-tone-mapping" || pname == "-tone-mapping" || pname == "-print-tone-mapping" || pname == "-make-tone-mapping")
 		{
+			input_format = IMAGE_HDR;
+			gammacor_in = false;			
 			make_hdr_tone_mapping = true;
 		}
 
 		/* ------- OTHER OUTPUT FILES */
+
+		if (pname == "-print-input-txt" || pname == "-print-txt-input")
+		{
+			print_input_txt = true;
+		}
 
 		if (pname.compare("-log") == 0 || pname.compare(">") == 0)
 		{
@@ -723,7 +831,7 @@ int main(int nargs, char** args){
 			
 			slice_list->clear();
 			printf("List cleared\n");
-			argi = read_input_list(slice_list, args, argi, nargs);
+			argi = Util::read_input_list(slice_list, args, argi, nargs);
 
 		}
 		if(pname == "-slice-only" || pname == "-only-slices" || pname == "print-slice-only")
@@ -732,7 +840,7 @@ int main(int nargs, char** args){
 			print_linear = false;
 		}
 
-		if(pname.compare("-txt") == 0 || pname.compare("-save-txt") == 0)
+		if(pname.compare("-txt") == 0 || pname.compare("-save-txt") == 0 || pname == "-print-txt")
 		{
 			save_txt = true;
 		}
@@ -744,7 +852,7 @@ int main(int nargs, char** args){
 		}
 
 		// Gamma or linear input/output
-		if (pname.compare("-g") == 0|| pname.compare("-gamma") == 0 )
+		/*if (pname.compare("-g") == 0|| pname.compare("-gamma") == 0 )
 		{
 			gammacor_in = true;
 			print_gamma = true;
@@ -757,13 +865,17 @@ int main(int nargs, char** args){
 			print_gamma = false;
 			print_linear = true;
 			gammacor_load_it = false;
-		}
+		}*/
 		if(pname.compare("-in-linear") == 0 || pname.compare("-linear-in") == 0 || pname.compare("-linear-input") == 0 || pname.compare("-input-linear") == 0 || pname == "-lin-in" || pname == "-in-lin")
 		{
 			gammacor_in = false;
 		}
 
 		if(pname.compare("-out-linear-also") == 0 || pname.compare("-linear-also") == 0 || pname == "-linear-output-also" || pname == "-output-linear-also")
+		{
+			print_linear = true;
+		}
+		if(pname == "-print-linear")
 		{
 			print_linear = true;
 		}
@@ -789,10 +901,14 @@ int main(int nargs, char** args){
 			print_gamma = true;
 			print_linear = false;
 		}
+		if(pname == "-print-gamma")
+		{
+			print_gamma = true;
+		}
 
 
 		// Print differences with input to PNG
-		if(pname == "-print-diff-rgb" || pname == "-print-diff-rgb-gamma" || pname == "-print-diff-gamma")
+		if(pname == "-print-diff-rgb" || pname == "-print-diff-rgb-gamma" || pname == "-print-diff-gamma" || pname == "-print-diff")
 		{
 			print_diff_gamma = true;
 		}
@@ -813,7 +929,7 @@ int main(int nargs, char** args){
 		{
 			txt_local_measure = true;
 		}
-		if(pname == "-print-lm-gamma" || pname == "-print-local-measure-gamma")
+		if(pname == "-print-lm-gamma" || pname == "-print-local-measure-gamma" || pname == "-print-lm")
 		{
 			print_local_measure_gamma = true;
 		}
@@ -835,38 +951,14 @@ int main(int nargs, char** args){
 		{
 			make_contrast_enhacement = true;
 			ce_factor_list.clear();
-			argi = read_input_list(&ce_factor_list, args, argi, nargs);
+			argi = Util::read_input_list<type>(&ce_factor_list, args, argi, nargs);
 		}
 		if(pname == "-ce-linear" || pname == "-contrast-enhancement-linear")
 		{
 			make_contrast_enhacement_linear = true;
 			ce_factor_list.clear();
-			argi = read_input_list(&ce_factor_list, args, argi, nargs);
+			argi = Util::read_input_list(&ce_factor_list, args, argi, nargs);
 		}
-
-
-		/* ALGORITHMS */
-		
-		if(pname.compare("-conf") == 0)
-		{
-			if(pname.compare("all") == 0)
-			{
-				check_and_add(&conf_list, conf_all);
-			}
-			else
-			{
-				if(conf_mod)
-				{				
-					std::string conf_string = std::string(args[argi]);
-					argi ++;
-
-					set_conf(conf_string);
-				}
-			}
-			printf("conf\n");
-
-		}
-
 
 		/* ALGORITHMS */
 
@@ -874,36 +966,60 @@ int main(int nargs, char** args){
 		{
 			if(conf_mod)
 			{
-				set_conf(std::string("arrgf"));
+				conf = CONF_ARRGF;
+				set_conf();
 			}
 		}
 		if(pname.compare("-rrgf") == 0)
 		{
 			if(conf_mod)
 			{
-				set_conf(std::string("rrgf"));
+				conf = CONF_RRGF;
+				set_conf();
 			}
 		}
 		if(pname.compare("-rgf") == 0)
 		{
 			if(conf_mod)
 			{
-				set_conf(std::string("rgf"));
+				conf = CONF_RGF;
+				set_conf();
 			}
 		}
 		if(pname.compare("-conv") == 0 || pname.compare("-convolution") == 0)
 		{
 			if(conf_mod)
 			{
-				set_conf(std::string("conv"));
+				conf = CONF_CONV;
+				set_conf();
 			}
 		}
 		if(pname.compare("-bilateral") == 0|| pname.compare("-bil") == 0)
 		{
 			if(conf_mod)
 			{
-				set_conf(std::string("bilateral"));
+				conf = CONF_BIL;
+				set_conf();
 			}
+		}
+
+		if(pname == "-gamma" || pname == "-gammify")
+		{
+			gammacor_in = false;
+			conf = CONF_GAMMIFY;
+			set_conf();
+		}
+		if(pname == "-ungamma" || pname == "-ungammify")
+		{
+			gammacor_in = true;
+			conf = CONF_UNGAMMIFY;
+			set_conf();
+		}
+
+		if(pname == "-to-gray" || pname == "-gray")
+		{
+			conf = CONF_TO_GRAY;
+			set_conf();
 		}
 
 		/* CONVERGENCE */
@@ -934,7 +1050,7 @@ int main(int nargs, char** args){
 			else
 			{
 				argi --;
-				argi = read_and_validate_input_list(&show_norm_list, &all_norms, args, argi, nargs, false);
+				argi = Util::read_and_validate_input_list(&show_norm_list, &all_norms, args, argi, nargs, false);
 			}
 
 		}
@@ -988,7 +1104,7 @@ int main(int nargs, char** args){
 			else
 			{
 				argi --;
-				argi = read_and_validate_input_list(&conv_norm_list, &all_norms, args, argi, nargs, false);
+				argi = Util::read_and_validate_input_list(&conv_norm_list, &all_norms, args, argi, nargs, false);
 			}
 		}
 		
@@ -996,7 +1112,7 @@ int main(int nargs, char** args){
 		if(pname.compare("-conv-eps") == 0)
 		{
 			conv_eps_list.clear();
-			argi = read_input_list(&conv_eps_list, args, argi, nargs);
+			argi = Util::read_input_list(&conv_eps_list, args, argi, nargs);
 			conv_eps_exp = true;
 			calc_norms = true;
 		}
@@ -1057,7 +1173,7 @@ int main(int nargs, char** args){
 			{
 				print_exp = 1;
 				it_list.clear();
-				argi = read_input_list(&it_list, args, argi, nargs);
+				argi = Util::read_input_list(&it_list, args, argi, nargs);
 			}
 
 		}
@@ -1112,15 +1228,19 @@ int main(int nargs, char** args){
 		if(pname.compare("-sr") == 0)
 		{
 			srValues.clear();
-			argi = read_input_list(&srValues, args, argi, nargs);
+			argi = Util::read_input_list(&srValues, args, argi, nargs);
 			sr_exp = true;
+		}
+		if(pname == "-fixed-sr" || pname == "-non-adaptive-sr")
+		{
+			adapt_sr = false;
 		}
 		
 		// Check for list of ss values
 		if(pname.compare("-ss") == 0)
 		{
 			ssValues.clear();
-			argi = read_input_list(&ssValues, args, argi, nargs);			
+			argi = Util::read_input_list(&ssValues, args, argi, nargs);			
 		}
 		// Regularization
 		if(pname.compare(std::string("-sreg")) == 0 || pname.compare("-s") == 0 || pname.compare("-reg-sigma") == 0 || pname.compare("-regularization-sigma") == 0 || pname.compare("-regs") == 0)
@@ -1129,13 +1249,13 @@ int main(int nargs, char** args){
 			{
 				sreg_exp = true;
 				sregValues.clear();
-				argi = read_input_list(&sregValues, args, argi, nargs);
+				argi = Util::read_input_list(&sregValues, args, argi, nargs);
 			}
 		}
 		if (pname == "-xic")
 		{
 			ssValues.clear();
-			argi = read_input_list(&ssValues, args, argi, nargs);
+			argi = Util::read_input_list(&ssValues, args, argi, nargs);
 			xic2ss<type>(ssValues, calibration_xicxss);
 			xic_exp = true;
 		}
@@ -1149,28 +1269,28 @@ int main(int nargs, char** args){
 
 		/* INPUT SCALING */
 
-		if(pname.compare("-scale") == 0)
+		if(pname == "-scale")
 		{
 			scaleValues.clear();
-			argi = read_input_list(&scaleValues, args, argi, nargs);
+			argi = Util::read_input_list(&scaleValues, args, argi, nargs);
 			scale_exp = true;
 
 		}
 		
-		if (pname.compare("-sb") == 0 || pname.compare("-scale-back") == 0)
+		if (pname == "-sb" || pname == "-scale-back")
 		{
 			scale_back = 1;
 			scale_back_name = "yes";
 		}
 		
 		// Show help
-		if(pname.compare(std::string("-help")) == 0)
+		if(pname == "-help")
 		{
 			showHelp();	
 			argi++;
 		}
 		
-		if(pname.compare(std::string("-infsr")) == 0)
+		if(pname == "-infsr")
 		{
 			infsr_exp = true;
 			infsr = atof(args[argi]);
@@ -1181,12 +1301,12 @@ int main(int nargs, char** args){
 			scale = atof(args[argi]);
 			argi++;
 		}*/
-		if(pname.compare(std::string("-cutoff")) == 0)
+		if(pname == "-cutoff")
 		{
 			cutoff = atof(args[argi]);
 			argi++;
 		}
-		if(pname.compare(std::string("-lm")) == 0 || pname.compare(std::string("-local-measure")) == 0 || pname == "-local_measure" || pname == "-lmker" || pname == "local-measure-kernel")
+		if(pname == "-lm" || pname == "-local-measure" || pname == "-local_measure" || pname == "-lmker" || pname == "local-measure-kernel")
 		{
 			std::string temp = std::string(args[argi]);
 			argi ++;
@@ -1369,7 +1489,7 @@ int main(int nargs, char** args){
 		}
 
 		// Range kernel
-		if(rker_mod && ( pname.compare(std::string("-rker")) == 0 || pname.compare(std::string("-intensity-kernel")) == 0 || pname.compare(std::string("-range-kernel")) == 0 || pname.compare("-range") == 0 ))
+		if(rker_mod && ( pname == "-rker" || pname == "-intensity-kernel" || pname == "-range-kernel" || pname == "-range" ))
 		{	
 			
 			std::string temp = std::string(args[argi]);
@@ -1479,13 +1599,7 @@ int main(int nargs, char** args){
  
 	}
 
-	//*********************************************************************************************************************************************************************************************
-	//*********************************************************************************************************************************************************************************************
-
-
-	// ************************ 	VALIDATION AND FILLING OF MISSING DATA, INITIALIZATION ALSO ************************************
-	// *****************************************************************************************************************************
-	
+	// ************************ 	VALIDATION AND FILLING OF MISSING DATA, INITIALIZATION ALSO ************************************	
 	// ******************************** CONVERGENCE ***********************
 	
 	if(show_conv)
@@ -1582,8 +1696,7 @@ int main(int nargs, char** args){
 		log_file_name = output_name + std::string(" - ") + get_conf_name(conf) + std::string(" - LOG - ") + std::string(dt) + std::string(".md");
 		if(debug) dprintf(0, "Log file output: %s\n", log_file_name.data());
 	}
-		
-	
+
 	// *** Log file loading 
 	if (save_log)
 	{
@@ -1594,261 +1707,331 @@ int main(int nargs, char** args){
 		}
 	}
 
-	
 	if(save_log)
 	{
 		fprintf(log_file, "Commands: %s", commands_string.data());
-	}	
-	
+	}
 
 	// ************************************ INFORM PARAMETERS TO USER *************************************************
-	// *****************************************************************************************************************
 
 	printf("\n\nALGORITHM:\t%s\n", get_conf_name(conf).data());
 	if (save_log) fprintf(log_file, "\nALGORITHM CONFIGURATION:\t%s (%i)\n", get_conf_name(conf).data(), conf);
 	
 	printf("\nPARAMETERS:\n");
 	
-	printf("\nInput: \t%s\n", input_name.data());
+	printf("\nInput: \t%s\n", (input_name + get_im_format(input_format)).data());
 	if(gammacor_in)
-		printf("Input will be gamma corrected.\n");
+		printf("INPUT is GAMMA corrected.\n");
 	else
-		printf("Input WONT	be gamma corrected.\n");
+		printf("INPUT is already in LINEAR SPACE.\n");
 	
 	if(save_log)
 	{
 		fprintf(log_file, "\nInput:\t%s\n", input_name.data());
 	}
 	
-	//printf("\nInput PNG image:%s.png\n", input_name.data());
-	//if (save_log) fprintf(log_file, "\nInput image:%s.png\n", input_name.data());
-	
 	//printf("Input scaling factor: %.2f\n", scale);
 	printf("Output image prefix: %s\n", output_name.data());
 	if (save_log) fprintf(log_file, "Output image: %s\n", output_name.data());
 	
-	printf("\nSpatial kernel:\t %s", get_ker_name(sker).data());
-	if(save_log) fprintf(log_file, "\nSpatial kernel:\t %s", get_ker_name(sker).data());
-	
-	printf("\n\tss values: \t"); printfVector(ssValues); printf("\n");
-	if(save_log)
+	if(conf == CONF_RGF || conf == CONF_ARRGF || conf == CONF_CONV)
 	{
-		fprintf(log_file, "\nss values: \t");
-		fprintfVector(log_file, ssValues);
-		fprintf(log_file, "\n");
-	}
-
-	printf("\nRegularization kernel:\t %s\n", get_ker_name(regker).data());
-	if(save_log) fprintf(log_file, "Regularization kernel:\t %s", get_ker_name(regker).data());
-
-	printf("\tsreg values: \t"); printfVector(sregValues); printf("\n");
-	if(save_log)
-	{
-		fprintf(log_file, "\nsreg values: \t");
-		fprintfVector(log_file, sregValues);
-		fprintf(log_file, "\n");
-	}
-	
-	printf("\nRange kernel:\t %s", get_ker_name(rker).data());
-	if (save_log) fprintf(log_file, "Range kernel:\t %s", get_ker_name(rker).data());
-	
-	printf("\n\tsr values: \t"); printfVector(srValues); printf("\n");
-	if(save_log)
-	{
-		fprintf(log_file, "\nsr values: \t");
-		fprintfVector(log_file, srValues);
-		fprintf(log_file, "\n");
-	}
-	
-	printf("\nInput Scaling values: \t"); printfVector(scaleValues); printf("\n");
-	if(save_log )
-	{
-		fprintf(log_file, "Input scaling values: \t");\
-		fprintfVector(log_file, scaleValues);
-		fprintf(log_file, "\n");
-	}
-	
-	printf("Scale back output: %s\n", scale_back_name.data());
-	if(save_log) fprintf(log_file, "Scale back output: %s\n", scale_back_name.data());
-	
-
-	
-	printf("\nAdaptive algorithm:\t %s (%i)\n", adaptive_name.data(), adaptive);
-	if(save_log) fprintf(log_file, "Adaptive algorithm:\t %s (%i)\n", adaptive_name.data(), adaptive);
-	printf("\tInfsr:\t%.4f\n", infsr);
-	
-	if(adaptive)
-	{
-		printf("\tLocal Measure:\t %s", get_lm_name(local_measure).data());
-		if (save_log) fprintf(log_file, "\tLocal measure calculation kernel for adaptiveness:\t %s\n", get_lm_name(local_measure).data());
-		if(!sl_exp)
-			printf("\n\tLocal measure weights:\t%s, sl = auto\n", get_w_name(lweights).data());
-		else
-			printf("\n\tLocal measure weights: \t%s, sl = %f", get_w_name(lweights).data(), sl);
-		if (save_log) fprintf(log_file, "\tLocal measure weights:\t%s, sl = %.4f\n", get_w_name(lweights).data(), sl);
-		printf("\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
-		if (save_log) fprintf(log_file, "\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
-	}
-	//printf("Median kernel:\t %s, ms = %.4f\n", mker_name.data(), sm);	
-	// if we are not spedified iterations to print, just last one
-	if(print_exp == 0 && calc_norms == false)
-	{
-		it_list.push_back(nit);
-	}
-	printf("\nITERATIONS to print:\t"); printfVector(it_list); printf("\n");
-	if(save_log)
-	{
-		fprintf(log_file, "Iterations to print:\t");
-		fprintfVector(log_file, it_list);
-		fprintf(log_file, "\n");
-	}
-	if(save_txt)
-	{
-		printf("Txt versions will also be saved in linear space in [0,1] range.\n");
-		if(save_log)
-			fprintf(log_file, "Txt versions will also be saved in linear space in [0,1] range.\n");
-	}
-	
-	if(gammacor_in == false) printf("Input will be read in linear space. (No gamma correction)\n");
-	else printf("Input will be gamma corrected.\n");
-	if(print_linear) printf("Output will be written in linear space (No gamma correction)\n");
-	if(print_gamma) printf("Output will be gamma corrected.\n");
-	if(save_log)
-	{
-		if(gammacor_in == false) fprintf(log_file, "Input will be read in linear space. (No gamma correction)\n");
-		if(print_gamma == false) fprintf(log_file, "Output will be written in linear space (No gamma correction)\n");
-	}
-	
-	if(load_it)
-	{
-		printf("Loading iteration %i from %s\n", it_from, it_from_image_name.data());
-		if(save_log) fprintf(log_file, "Loading iteration %i from %s\n", it_from, it_from_image_name.data());
-	}
-	if(calc_norms)
-	{
-		printf("\nConvergence criteria:\t");
-		printfVector(conv_norm_list);
-		printf("\n");
+		printf("\nSpatial kernel:\t %s", get_ker_name(sker).data());
+		if(save_log) fprintf(log_file, "\nSpatial kernel:\t %s", get_ker_name(sker).data());
 		
-		if (save_log)
+		printf("\n\tss values: \t"); printfVector(ssValues); printf("\n");
+		if(save_log)
 		{
-			fprintf(log_file, "\nConvergence criteria:\t" );
-			fprintfVector(log_file, conv_norm_list);
+			fprintf(log_file, "\nss values: \t");
+			fprintfVector(log_file, ssValues);
+			fprintf(log_file, "\n");
+		}
+
+		printf("\nRegularization kernel:\t %s\n", get_ker_name(regker).data());
+		if(save_log) fprintf(log_file, "Regularization kernel:\t %s", get_ker_name(regker).data());
+
+		printf("\tsreg values: \t"); printfVector(sregValues); printf("\n");
+		if(save_log)
+		{
+			fprintf(log_file, "\nsreg values: \t");
+			fprintfVector(log_file, sregValues);
 			fprintf(log_file, "\n");
 		}
 		
-		printf("Convergence for eps :"); printfVector(conv_eps_list); printf("\n");
+		printf("\nRange kernel:\t %s", get_ker_name(rker).data());
+		if (save_log) fprintf(log_file, "Range kernel:\t %s", get_ker_name(rker).data());
+		
+		printf("\n\tsr values: \t"); printfVector(srValues); printf("\n");
 		if(save_log)
 		{
-			 fprintf(log_file, "Convergence norm epsilon : "); fprintfVector(log_file, conv_eps_list); fprintf(log_file, "\n"); 
-		}
-		if (force_stop_on_convergence)
-		printf("* Algorithm will STOP if convergence is reached.\n");
-		if(save_log) fprintf(log_file, "* Algorithm will STOP if convergence is reached because of -force-stop.\n");
-		
-		printf("* Printing convergence iterations by default.\n");
-		if(save_log) fprintf(log_file, "* Printing convergence iterations by default.\n");
-		
-		printf("\nShowing info for norms : ");
-		printfVector(show_norm_list);
-		printf("\n");
-		
-		if(show_conv) printf("Showing convergence for  eps = "); printfVector(conv_eps_list);
-		if (print_alt_conv) printf("Printing Convergence Iterations for these norms.\n");
-		
-		if(save_log)
-		{
-			fprintf(log_file, "\nShowing info for norms : ");
-			fprintfVector(log_file, show_norm_list);
+			fprintf(log_file, "\nsr values: \t");
+			fprintfVector(log_file, srValues);
 			fprintf(log_file, "\n");
+		}
+		
+		printf("\nInput Scaling values: \t"); printfVector(scaleValues); printf("\n");
+		if(save_log )
+		{
+			fprintf(log_file, "Input scaling values: \t");\
+			fprintfVector(log_file, scaleValues);
+			fprintf(log_file, "\n");
+		}
+		
+		printf("Scale back output: %s\n", scale_back_name.data());
+		if(save_log) fprintf(log_file, "Scale back output: %s\n", scale_back_name.data());
+		
+
+		
+		printf("\nAdaptive algorithm:\t %s (%i)\n", adaptive_name.data(), adaptive);
+		if(save_log) fprintf(log_file, "Adaptive algorithm:\t %s (%i)\n", adaptive_name.data(), adaptive);
+		printf("\tInfsr:\t%.4f\n", infsr);
+		
+		if(adaptive)
+		{
+			printf("\tLocal Measure:\t %s", get_lm_name(local_measure).data());
+			if (save_log) fprintf(log_file, "\tLocal measure calculation kernel for adaptiveness:\t %s\n", get_lm_name(local_measure).data());
+			if(!sl_exp)
+				printf("\n\tLocal measure weights:\t%s, sl = auto\n", get_w_name(lweights).data());
+			else
+				printf("\n\tLocal measure weights: \t%s, sl = %f", get_w_name(lweights).data(), sl);
+			if (save_log) fprintf(log_file, "\tLocal measure weights:\t%s, sl = %.4f\n", get_w_name(lweights).data(), sl);
+			printf("\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
+			if (save_log) fprintf(log_file, "\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
+		}
+		//printf("Median kernel:\t %s, ms = %.4f\n", mker_name.data(), sm);	
+		// if we are not spedified iterations to print, just last one
+		if(print_exp == 0 && calc_norms == false)
+		{
+			it_list.push_back(nit);
+		}
+		printf("\nITERATIONS to print:\t"); printfVector(it_list); printf("\n");
+		if(save_log)
+		{
+			fprintf(log_file, "Iterations to print:\t");
+			fprintfVector(log_file, it_list);
+			fprintf(log_file, "\n");
+		}
+		if(save_txt)
+		{
+			printf("Txt versions will also be saved in linear space in [0,1] range.\n");
+			if(save_log)
+				fprintf(log_file, "Txt versions will also be saved in linear space in [0,1] range.\n");
+		}
+		
+		if(gammacor_in == false) printf("Input will be read in linear space. (No gamma correction)\n");
+		else printf("Input will be gamma corrected.\n");
+		if(print_linear) printf("Output will be written in linear space (No gamma correction)\n");
+		if(print_gamma) printf("Output will be gamma corrected.\n");
+		if(save_log)
+		{
+			if(gammacor_in == false) fprintf(log_file, "Input will be read in linear space. (No gamma correction)\n");
+			if(print_gamma == false) fprintf(log_file, "Output will be written in linear space (No gamma correction)\n");
+		}
+		
+		if(load_it)
+		{
+			printf("Loading iteration %i from %s\n", it_from, it_from_image_name.data());
+			if(save_log) fprintf(log_file, "Loading iteration %i from %s\n", it_from, it_from_image_name.data());
+		}
+		if(calc_norms)
+		{
+			printf("\nConvergence criteria:\t");
+			printfVector(conv_norm_list);
+			printf("\n");
 			
-			if(show_conv) fprintf(log_file, "Showing convergence for  eps = "); fprintfVector(log_file, conv_eps_list);
-			if (print_alt_conv) fprintf(log_file, "Printing Convergence Iterations for these norms.\n");		
+			if (save_log)
+			{
+				fprintf(log_file, "\nConvergence criteria:\t" );
+				fprintfVector(log_file, conv_norm_list);
+				fprintf(log_file, "\n");
+			}
+			
+			printf("Convergence for eps :"); printfVector(conv_eps_list); printf("\n");
+			if(save_log)
+			{
+				fprintf(log_file, "Convergence norm epsilon : "); fprintfVector(log_file, conv_eps_list); fprintf(log_file, "\n"); 
+			}
+			if (force_stop_on_convergence)
+			printf("* Algorithm will STOP if convergence is reached.\n");
+			if(save_log) fprintf(log_file, "* Algorithm will STOP if convergence is reached because of -force-stop.\n");
+			
+			printf("* Printing convergence iterations by default.\n");
+			if(save_log) fprintf(log_file, "* Printing convergence iterations by default.\n");
+			
+			printf("\nShowing info for norms : ");
+			printfVector(show_norm_list);
+			printf("\n");
+			
+			if(show_conv) printf("Showing convergence for  eps = "); printfVector(conv_eps_list);
+			if (print_alt_conv) printf("Printing Convergence Iterations for these norms.\n");
+			
+			if(save_log)
+			{
+				fprintf(log_file, "\nShowing info for norms : ");
+				fprintfVector(log_file, show_norm_list);
+				fprintf(log_file, "\n");
+				
+				if(show_conv) fprintf(log_file, "Showing convergence for  eps = "); fprintfVector(log_file, conv_eps_list);
+				if (print_alt_conv) fprintf(log_file, "Printing Convergence Iterations for these norms.\n");		
+			}
+			
 		}
-		
-	}
-	else
-	{
-		printf("\nConvergence metric:\tnone\n");
-		if(save_log) fprintf(log_file, "Convergence metric:\tnone\n");
-	}
+		else
+		{
+			printf("\nConvergence metric:\tnone\n");
+			if(save_log) fprintf(log_file, "Convergence metric:\tnone\n");
+		}
 
-	if(save_log)
-		printf("\nlog file will be saved to %s\n", log_file_name.data());
-		
-		
-		
-	// ************* INPUT LOADING ********************************
-	// ****************************************************************
+		if(save_log)
+			printf("\nlog file will be saved to %s\n", log_file_name.data());
+	
+	}
+	
+	// ---------------- INPUT LOADING ---------------------------------------------------------------------------
+	// ----------------------------------------------------------------------------------------------------------
 		
 	if(debug) printf("\n LOADING INPUT AND INITIALIZATION OF CPU / GPU ARRAYS .. \n");
 	
-	int H, W, nchannels, nch_no_alpha;
-	int gH, gW, gnchannels, gnch_no_alpha;
-	unsigned char color_type, bit_depth;
-	unsigned char gcolor_type, gbit_depth;
+	int f_nchannels, f_valid_channels;
+	int gH, gW, gnchannels, gvalid_channels;
+	unsigned char f_bit_depth;
+	unsigned char gbit_depth;
 	//pixel buffer
 	unsigned char *pixels = NULL;
 	unsigned char *gpixels = NULL;
+
+	// Info for input of RGF algorithm. Can be gray version of f
+	int nchannels, valid_channels;
 	
-	printf("Reading input image f ... ");
-	//read_png(args[1], H, W, nchannels, pixels, color_type, bit_depth, nch_no_alpha);
-	read_png((input_name + ".png").data(), H, W, nchannels, pixels, color_type, bit_depth, nch_no_alpha);
-	if(bit_depth != 8)
+	dprintf(0,"Reading input image f ... ");
+	//read_png(args[1], H, W, nchannels, pixels, bit_depth, valid_channels);
+
+	// Array to store input data
+	type *host_input_f = NULL;
+	int f_rgb_format = MATRIX_RGB_TYPE_INTER;
+
+	int RGB_REF = pow(2, 8) -1;
+
+	// ---------- READ INPUT using type defined by user ------------------------------------------------------------
+	
+	// HDR image reading. Output = RGB RGB RGB
+	if(input_format == IMAGE_HDR)
 	{
-		dprintf(0, "Reading Input: bit depth of %i is not supported yet. Aborting ... \n", bit_depth);
-		return 0;
+		dprintf(0, "\nReading IMAGE_HDR\n");
+
+		HDRLoaderResult <type> *hdrData = new HDRLoaderResult<type>();
+		HDRLoader *hdrLoader = new HDRLoader();
+
+		const char* input = (input_name + get_im_format(input_format)).data();
+		
+		if( ! hdrLoader->load<type>(input , *hdrData ) ) {
+			printf( "error loading %s \n", input );
+			return 1;
+		}
+		// Assign H and W values and get data in format grayscale L_R L_R .. L_G L_G ...
+		W = hdrData -> width;
+		H = hdrData -> height;
+		host_input_f = hdrData -> cols;
+
+		// HDR reader reads in cols in format rgb LLL L = 	RGB RGB
+		f_nchannels = 3;
+		f_valid_channels = 3;
+		f_rgb_format = MATRIX_RGB_TYPE_INTER;
+
+		// Change format to RRRR GGGG BBBB
+		type *temp = new type[H * W * f_nchannels];
+		f_rgb_format = Matrix::change_rgb_format(host_input_f, temp, H * W, 3, f_rgb_format);
+		std::swap(host_input_f, temp);
+		delete[] temp;
+
+		dprintf(0, "RGB format changed.\n");
+		
+		gammacor_in = false;
+		load_it = false;
+
+		dprintf(0, "Reading input HDR done.\n");
+	
 	}
-	if(load_it)
+	// Reading typical GRAY or RGB 8b images
+	else if(input_format == IMAGE_PNG)
 	{
-		read_png((it_from_image_name + ".png").data(), gH, gW, gnchannels, gpixels, gcolor_type, gbit_depth, gnch_no_alpha);
-		if(gbit_depth != 8)
+		dprintf(0, "\nReading IMAGE_PNG image\n");
+		read_png((input_name + get_im_format(input_format)).data(),  pixels, H, W, f_nchannels, f_bit_depth, debug);
+		
+		f_valid_channels = f_nchannels;
+		if(f_nchannels == 2 || f_nchannels == 4) f_valid_channels -= 1;
+		
+		if(f_bit_depth != 8)
 		{
-			dprintf(0, "Reading Input Iteration: bit depth of %i is not supported yet. Aborting ... \n", gbit_depth);
+			dprintf(0, "Reading Input: bit depth of %i is not supported yet. Aborting ... \n", f_bit_depth);
 			return 0;
 		}
-			// Images have to match
-		if(gH != H || gW != W || gnchannels != nchannels || gcolor_type != color_type || gnch_no_alpha != nch_no_alpha)
-		{
-			dprintf(0, "Input and Iteration images do not match.\n");
-			return 0;
+		printf("Image width: %i, Image height: %i, Number of channels: %i, valid channels: %i\n",H, W, f_nchannels, f_valid_channels);
+
+		// Initialize host_f
+		host_input_f = new type[f_valid_channels * H * W];
+		//HOST: Create arrays for each channel, alpha channel will not be filtered
+		// Will save host iterations as well as norms to show
+
+		for(int ch = 0; ch< f_valid_channels ; ch++){
+			unsigned char *p = (pixels + ch);
+			//fill channel i for f
+			for(int i = 0; i< H*W; i++){
+			
+				type val = ((type)(*p))/RGB_REF;
+				// Initialize images in Host
+				host_input_f[ch * W * H + i] = val;			
+				p += f_nchannels;
+			}
 		}
+
+		f_rgb_format = MATRIX_RGB_TYPE_CHUNK;
+
+		// Ungamma input to have linear input
+		if(gammacor_in)
+		{
+			Matrix::ungamma<type>(host_input_f, host_input_f, H * W * f_valid_channels);
+		}
+
+		valid_channels = f_valid_channels;
+		nchannels = f_nchannels;
+
+		if(load_it)
+		{
+			read_png(it_from_image_name + ".png", gpixels, gH, gW, gnchannels,  gbit_depth, debug);
+			if(gbit_depth != 8)
+			{
+				dprintf(0, "Reading Input Iteration: bit depth of %i is not supported yet. Aborting ... \n", gbit_depth);
+				return 0;
+			}
+				// Images have to match
+			if(gH != H || gW != W || gnchannels != f_nchannels)
+			{
+				dprintf(0, "Input and Iteration images do not match.\n");
+				return 0;
+			}
+			
+			gvalid_channels = gnchannels;
+			if(gnchannels == 2 || gnchannels == 4) gvalid_channels -= 1; 
+		}
+
 	}
 
-	printf("Image width: %i, Image height: %i, Number of channels: %i  ",H, W, nchannels);
-	if(debug) printf("done.\n");
-	
-	type RGB_REF = pow(2, bit_depth) -1;
-	
-	if(debug) printf("Creating arrays of channels for f and g and get out gamma correction if wanted ... ");
-	
-	//HOST: Create arrays for each channel, alpha channel will not be filtered
-	type *host_f = new type[nch_no_alpha * H * W];
-	type *host_g = new type[nch_no_alpha * H * W];
-	type *host_temp = new type[nch_no_alpha * H * W];	// Will save host iterations as well as norms to show
-	
-	if(debug) dprintf(0, "Initializing f in Host ... ");
-	for(int ch = 0; ch< nch_no_alpha ; ch++){
-		unsigned char *p = (pixels + ch);
-		//fill channel i for f
-		for(int i = 0; i< H*W; i++){
-		
-			type val = ((type)(*p))/RGB_REF;
-			// Take out gamma correction
-			if(gammacor_in == true){
-				if(val <= 0.04045)
-					val = val/12.92f;
-				else	
-					val = pow( (val + 0.055f)/1.055, 2.4f);
-			}
-			// Initialize images in Host
-			host_f[ch * W * H + i] = val;			
-			p += nchannels;
-		}
+	// Max and min values of f
+	dprintf(0, "Calculating min(f) and max(f) values\n");
+	type f_max = Matrix::max_rgb_norm2<type>(host_input_f, H, W, f_valid_channels);
+	type f_min = Matrix::min_rgb_norm2<type>(host_input_f, H, W, f_valid_channels);
+	type f_range = sqrt(f_max) - sqrt(f_min);
+	dprintf(0,  "\tmin(f) = %f and max(f) = %f \n", f_min, f_max);
+
+	// ---------- Save txt slices for original function f also for comparisons ---------------------------------
+
+	if(print_input_txt)
+	{
+		dprintf(0, "\nSaving TXT version for INPUT ...");
+		std::string out_name = output_name;
+		Util::printToTxt<type>(out_name , host_input_f, H, W, f_valid_channels, "%.8f\t", f_rgb_format);
 	}
-	if(debug) dprintf(0, "done.\n");
-	
-	// Save txt slices for original function also if for comparisons
 	
 	if(h_slice_list.size() > 0)
 	{
@@ -1856,14 +2039,14 @@ int main(int nargs, char** args){
 		for(int index = 0; index < (int)h_slice_list.size(); index++)
 		{
 			int i = h_slice_list.at(index);
-			std::string slice_file_name = input_name + "-hslice_" + Patch::to_string(i) + ".txt";
+			std::string slice_file_name = output_name + "-hslice_" + Patch::to_string(i) + ".txt";
 			FILE *slice_file = fopen(slice_file_name.data(), "w");
 			 
 			for(int j = 0; j < W; j++)
 			{
-				for(int ch = 0; ch < nch_no_alpha; ch ++)
+				for(int ch = 0; ch < f_valid_channels; ch ++)
 				{
-					fprintf(slice_file, "%.8f\t", host_f[ch * W * H + i * W + j]);
+					fprintf(slice_file, "%.8f\t", host_input_f[ch * W * H + i * W + j]);
 				}
 				fprintf(slice_file, "\n");
 			}
@@ -1878,14 +2061,14 @@ int main(int nargs, char** args){
 		for(int index = 0; index < (int)v_slice_list.size(); index++)
 		{
 			int j = v_slice_list.at(index);
-			std::string slice_file_name = input_name + "-vslice_" + Patch::to_string(j) + ".txt";
+			std::string slice_file_name = output_name + "-vslice_" + Patch::to_string(j) + ".txt";
 			FILE *slice_file = fopen(slice_file_name.data(), "w");
 			 
 			for(int i = 0; i < W; i++)
 			{
-				for(int ch = 0; ch < nch_no_alpha; ch ++)
+				for(int ch = 0; ch < f_valid_channels; ch ++)
 				{
-					fprintf(slice_file, "%.8f\t", host_f[ch * W * H + i * W + j]);
+					fprintf(slice_file, "%.8f\t", host_input_f[ch * W * H + i * W + j]);
 				}
 				fprintf(slice_file, "\n");
 			}
@@ -1893,284 +2076,452 @@ int main(int nargs, char** args){
 			dprintf(0, "Input V slice %d saved in %s.\n", j, (slice_file_name ).data());						
 		}
 	}
-	printf("\n");	
+	printf("\n");
 
-	// **** Intialization of data for algorithms
 	
-	if(debug) dprintf(0, "Initializing g in Host ...");
-	for(int ch = 0; ch< nch_no_alpha ; ch++){
-		unsigned char *p = (gpixels +ch);
-		//fill channel i for f
-		for(int i = 0; i< H*W; i++){	
-			// Initialize images in Host		
-			if(load_it == false)
-			{
-				if(conf == 3 )
-				{
-					host_g[ch * W * H + i] = host_f[ch * W * H + i];	// bilateral filter starts with f
-				}
-				else
-				{
-					host_g[ch * W * H + i] = (type) 0;
-				}
-			}
-			else
-			{
-				type val = ((type)(*p))/RGB_REF;
-			
-				// Take out gamma correction
-				if(load_it_gammacor){
-					if(val <= 0.04045)
-						val = val/12.92f;
-					else	
-						val = pow( (val + 0.055f)/1.055, 2.4f);
-				}
-				host_g[ch * W + H + i] = val;
-			}
-			p += nchannels;
-		}
-	}
-	if(debug) dprintf(0, "done.\n");
-
-	// Scale sr value to have a fair RGF comparison
-
-	type f_max = max_rgb_norm2<type>(host_f, H, W, nch_no_alpha);
-	type f_min = min_rgb_norm2<type>(host_f, H, W, nch_no_alpha);
-	type f_range = sqrt(f_max) - sqrt(f_min);
+	/* GPU info */
 	
-	
-	if(debug) printf("GPU INITIALIZATION\n");
-	if(debug) printf("Getting available GPU memory ...\n");
+	if(debug) dprintf(0, "GPU INFORMATION\n");
+	if(debug) dprintf(0, "Getting available GPU memory ...\n");
 	size_t free;
 	size_t total;
 	cudaMemGetInfo(&free, &total);
 	
 	if (debug) printf("There are %lu bytes available of %lu\n", free, total);
-	long unsigned int needgpu = 4 * nch_no_alpha * H * W* sizeof(type) +  H * W* sizeof(type);
+	long unsigned int needgpu = 4 * f_valid_channels * H * W* sizeof(type) +  H * W* sizeof(type);
 	if(debug) printf("allocating images memory in device, need at least %lu free bytes on GPU ... \n", needgpu);
 	if(free < needgpu)
 		if(debug) printf("Not enough available memory on GPU. There can be errors.\n");
-		
-	// DEVICE memory allocation
-	if(debug) printf("allocating images memory in device ... ");
-	type *dev_f, *dev_g, *dev_g_last;
-	type *dev_stdev, *dev_temp;
-	type *dev_temp2;
-	if(calc_norms){
-		cudaMalloc((void**)&dev_g_last, nch_no_alpha * H * W * sizeof(type));
-		gpuErrChk( cudaPeekAtLastError() );
-	}
-	if(adaptive)
-	{
-		cudaMalloc((void**)&dev_stdev, H * W * sizeof(type));
-		gpuErrChk( cudaPeekAtLastError() );
-	}
-	cudaMalloc((void**)&dev_temp, nch_no_alpha * H * W * sizeof(type));
-	gpuErrChk( cudaPeekAtLastError() );
-	
-	cudaMalloc((void**)&dev_temp2, nch_no_alpha * H * W * sizeof(type));
-	gpuErrChk( cudaPeekAtLastError() );
-	
-	cudaMalloc((void**)&dev_f, nch_no_alpha * H * W * sizeof(type));
-	gpuErrChk( cudaPeekAtLastError() );
-	cudaMalloc((void**)&dev_g, nch_no_alpha * H * W * sizeof(type));
-	gpuErrChk( cudaPeekAtLastError() );
-	
-	if(debug) printf("done.\n");
-	
-	type *host_local_measure = NULL;
-	if(txt_local_measure || print_local_measure_gamma || print_local_measure_linear)
-	{
-		host_local_measure = new type[H * W];
-	}
-	
-	dim3 ggridsize = dim3(ceil((type)W/gbsX), ceil((type)H/gbsY), 1);
-	dim3 gblocksize = dim3(gbsX, gbsY,1);
+
 	
 	// ******************************************************************************************************************************
 	//  ************* FILTERING 
 	// ******************************************************************************************************************************
-	
-	bool print_it = false; // True if iteration is to be printed	
-	output_name = output_name + "-" + get_conf_name(conf);
-	
-	// LOOPS:
-	if(debug) dprintf(0, "Starting SCALEloop \n");
-	for(int i = 0; i < (int)scaleValues.size(); i++)
-	{
-	
-		type scale = scaleValues.at(i);
-		if(debug) dprintf(0, "scale = %.2f\n", scale);
 
-		// Scale range
-		f_range *= scale;
-		if(f_range == 0) f_range = 1.0;
+	// Pointers to real input for algorithm. Can be modified version of host_input_f
+	type *host_f = host_input_f;
+
+	valid_channels = f_valid_channels;
+	nchannels = f_nchannels;
+
+	int bit_depth = f_bit_depth;
+	int rgb_format = f_rgb_format;
+
+	// Pointer for output 
+	//type *host_output = NULL;
+
+	output_name = output_name + "-" + get_conf_name(conf);
+
+	if(conf == CONF_GAMMIFY)
+	{
+		std::string final_output_name = output_name + get_im_format(output_format);
+		//unsigned char* p = pixels;
+		unsigned char * pixels = new unsigned char[H * W * f_valid_channels];
 		
-		if(debug) dprintf(0,"Copying data into device ... ");
-		for(int ch = 0; ch<nch_no_alpha; ch++){
+		unsigned char *p = pixels;
+		for(int i = 0; i< H*W; i++)
+		{
+			//Change first color channels
+			for(int ch = 0; ch < f_valid_channels; ch ++){
+				type val = (type)(host_f[ch * H * W + i]);				
+				// Apply gamma
+				val = Matrix::apply_gamma(val);
+				*p = (unsigned char)(val * RGB_REF);
+				p++;
+			}
+			//Skip possible alpha channel (last channel)
+			for(int ch = f_valid_channels; ch < f_nchannels; ch ++){
+				p++;
+			}
+		}
+		if(debug) dprintf(0, "done.\n");
+
+		// Save PNG image
+		dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
+		write_png(final_output_name, pixels, H, W, f_nchannels, 8, debug);
+		dprintf(0, "\n > %s saved.", final_output_name.data());
+		if(save_log)
+		{
+			fprintf(log_file, "\n > %s saved.", final_output_name.data());
+		}
+
+		return 1;
+
+	}
+
+	// If we just want to apply gamma or take out gamma. Gamma is already taken out.
+	if(conf == CONF_UNGAMMIFY)
+	{
+		std::string final_output_name = output_name + get_im_format(output_format);
+		//unsigned char* p = pixels;
+		unsigned char * pixels = new unsigned char[H * W * f_nchannels];
+		
+		unsigned char *p = pixels;
+		for(int i = 0; i< H*W; i++)
+		{
+			//Change first color channels
+			for(int ch = 0; ch < f_valid_channels; ch ++){
+				type val = (host_f[ch * H * W + i]);
+				*p = (unsigned char)(val * RGB_REF);
+				p++;
+			}
+			//Skip possible alpha channel (last channel)
+			for(int ch = f_valid_channels; ch < f_nchannels; ch ++){
+				p++;
+			}
+		}
+		if(debug) dprintf(0, "done.\n");
+
+		// Save PNG image
+		dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
+		write_png(final_output_name, pixels, H, W, f_nchannels, f_bit_depth, debug);
+		dprintf(0, "\n > %s saved.", final_output_name.data());
+		if(save_log)
+		{
+			fprintf(log_file, "\n > %s saved.", final_output_name.data());
+		}
+
+		return 1;
+
+	}
+
+	if (conf == CONF_TO_GRAY)
+	{
+		type *host_f_gray = new type[H * W];
+		/*Matrix::RGB_to_Gray(host_input_f, host_f_gray, H * W, f_valid_channels, f_rgb_format);*/
+		for(int i = 0; i < H*W; i++)
+		{
+			host_f_gray[i] = 0.2989*host_input_f[3 * i ] + 0.587* host_input_f[3 * i + 1] + 0.114*host_input_f[3*i + 2];
+		}
+		// save to png
+		
+		unsigned char * pixels = new unsigned char[H * W ];
+
+		if(print_linear)
+		{
+			for(int i = 0; i < H * W ; i++)
+			{
+				pixels[i] = (unsigned char) (host_f_gray[i] * 255);
+			}
+			std::string output_file_name = output_name +  "-LINEAR-" + get_im_format(output_format) ;
+			dprintf(0, "\nOUTPUT PNG in LINEAR space ...");
+			write_png(output_file_name , pixels, H, W, 1 , 8, debug);
+			dprintf(0, "\n\t > %s saved.\n", output_file_name.data());
+		}
+
+		if(print_gamma)
+		{
+			std::string output_file_name = output_name + get_im_format(output_format);
+			for(int i = 0; i < H * W ; i++)
+			{
+				pixels[i] = (unsigned char) (Matrix::apply_gamma<type>(host_f_gray[i]) * 255);
+			}
+			dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
+			write_png(output_file_name , pixels, H, W, 1 , 8, debug);
+			dprintf(0, "\n\t > %s saved.\n", output_file_name.data());
+		}
+		
+		delete[] host_f_gray, host_input_f, pixels;
+		return 1;
+
+	}
+
+	if(conf == CONF_RGF || CONF_ARRGF || CONF_CONV)
+	{
+		dprintf(0, "%s", (std::string("Configuration: ") + get_conf_name(conf) + "\n").data()) ;
+
+		//type *host_f_gray_log = NULL;
+
+		// If we want to make hdr tone mapping, we need to convert to gray scale as input
+		if(make_hdr_tone_mapping)
+		{
+			dprintf(0, "\nConverting to GRAY for HDR tone mapping ... ");
+			type *host_f_gray = new type[H * W];
+			//host_f_gray_log = new type[H * W];
+
+			valid_channels = 1;
+			nchannels = 1;
+
+			Matrix::RGB_to_Gray(host_input_f, host_f_gray, H * W, f_valid_channels, f_rgb_format);
+			/*for(int i = 0; i < H*W; i++)
+			{
+				host_f_gray[i] = 0.2126*host_input_f[3 * i ] + 0.7152* host_input_f[3 * i + 1] + 0.0722*host_input_f[3*i + 2];
+			}*/
+			dprintf(0, "\n\tRGB to Gray calculated.");
+
+			host_f = host_f_gray;
+			
+		}
+
+		/* Allocate other arrays memory in host */
+		type *host_g = new type[valid_channels * H * W];
+		type *host_temp = new type[valid_channels * H * W];
+
+		// Intialize g in host
+		if(debug) dprintf(0, "\nInitializing g in Host ...");
+		if(!load_it)
+		{
+			for(int ch = 0; ch< valid_channels ; ch++){
+				//fill channel i for f
+				for(int i = 0; i< H*W; i++){	
+					// Initialize images in Host	
+					if(conf == 3 )
+					{
+						host_g[ch * W * H + i] = host_f[ch * W * H + i];	// bilateral filter starts with f
+					}
+					else
+					{
+						host_g[ch * W * H + i] = (type) 0;
+					}
+				}
+			}
+		} else {
+			for(int ch = 0; ch< valid_channels ; ch++){
+				unsigned char *p = (gpixels +ch);
+				//fill channel i for f
+				for(int i = 0; i< H*W; i++)
+				{	
+					// Initialize images in Host		
+						type val = ((type)(*p))/RGB_REF;
+					
+						// Take out gamma correction
+						if(load_it_gammacor){
+							if(val <= 0.04045)
+								val = val/12.92f;
+							else	
+								val = pow( (val + 0.055f)/1.055, 2.4f);
+						}
+						host_g[ch * W + H + i] = val;
+					}
+					p += nchannels;
+				}
+		}
+		if(debug) dprintf(0, "done.\n");
+
+		/* Allocate GPU arrays */
+		type *dev_f;
+		cudaMalloc((void**)&dev_f, valid_channels * H * W * sizeof(type));
+		gpuErrChk( cudaPeekAtLastError() );
+		if(debug) dprintf(0,"\nCopying data into device ... ");
+		for(int ch = 0; ch < valid_channels; ch++ ){
 			cudaMemcpy(dev_f + ch*H*W , host_f + ch * H * W, H*W*sizeof(type), cudaMemcpyHostToDevice);
 			gpuErrChk( cudaPeekAtLastError() );		
 		}
-		if(debug) dprintf(0, "Scaling input for scale = %.2f", scale);
-		for(int i = 0; i<nch_no_alpha; i++)
+
+		/* GPU arrays */
+		if(debug) printf("\nAllocating images memory in device ... ");
+		type *dev_g, *dev_g_last;
+		type *dev_stdev, *dev_temp;
+		type *dev_temp2;
+		
+		type *host_local_measure = NULL;
+		if(txt_local_measure || print_local_measure_gamma || print_local_measure_linear)
 		{
-			scale_kernel<type><<<ggridsize, gblocksize>>>(dev_f + i * H * W, dev_temp + i * H * W,  scale, H, W);
+			host_local_measure = new type[H * W];
+		}
+		
+		dim3 ggridsize = dim3(ceil((type)W/gbsX), ceil((type)H/gbsY), 1);
+		dim3 gblocksize = dim3(gbsX, gbsY,1);
+
+		// Initialize other helpful GPU arrays
+		if(adaptive)
+		{
+			cudaMalloc((void**)&dev_stdev, H * W * sizeof(type));
 			gpuErrChk( cudaPeekAtLastError() );
 		}
-		std::swap(dev_f, dev_temp);
+		cudaMalloc((void**)&dev_temp, valid_channels * H * W * sizeof(type));
+		gpuErrChk( cudaPeekAtLastError() );
 		
-
+		cudaMalloc((void**)&dev_temp2, valid_channels * H * W * sizeof(type));
+		gpuErrChk( cudaPeekAtLastError() );
 		
-	if(debug) dprintf(0, "\nStarting SS loop");
-	for(int i = 0; i < (int)ssValues.size(); i++)
-	{		
-		type ss = ssValues.at(i);
-		if(debug) dprintf(0, "ss = %.2f\n", ss);
 	
-		if(!sl_exp) sl = ss;
+		cudaMalloc((void**)&dev_g, valid_channels * H * W * sizeof(type));
+		gpuErrChk( cudaPeekAtLastError() );
+
+		if(calc_norms){
+			cudaMalloc((void**)&dev_g_last, valid_channels * H * W * sizeof(type));
+			gpuErrChk( cudaPeekAtLastError() );
+		}
+
+		// Generic output name
+		bool print_it = false; // True if iteration is to be printed
+
+		// FILTERING LOOPS:
+
+		// Loop for scale values (scale)
+		if(debug) dprintf(0, "\nStarting SCALEloop \n");
+		for(int i = 0; i < (int)scaleValues.size(); i++)
+		{
+		
+			type scale = scaleValues.at(i);
+			if(debug) dprintf(0, "scale = %.2f\n", scale);
+
+			// Scale range
+			f_range *= scale;
+			if(f_range == 0) f_range = 1.0;
 			
-		// Calculate size of regions
-		switch(sker)
-		{
-			case 0:
-				sskh = ceil(3.0f * ss);
-				sskw = ceil(3.0f * ss);
-				break;
-			case 1:
-				sskh = ceil(ss);
-				sskw = ceil(ss);
-				break;
-			case 2:
-				sskh = ceil(ss);
-				sskw = ceil(ss);
-				break;
-			case 3:
-				sskh = ceil(ss);
-				sskw = ceil(ss);
-				break;
-			case 4:
-				sskh = ceil(0.5f * M / ss);
-				sskw = ceil(0.5f * M / ss);
-			case 5:
-				sskh = ceil( 0.5f * M /  ss);
-				sskw = ceil( 0.5f * M / ss);
-				break;
-			default:
-				break;
-		}
-		if(debug) dprintf(0, "ss Region for gpu: sskh = %i, sskw = %i\n", sskw, sskw);
-	
-	// Loop for regularization values (fraction of ss)
-	if(debug) dprintf(0, "\nStarting SREG loop ...");		
-	for(int i = 0; i < sregValues.size(); i++)
-	{
-		type sreg = sregValues.at(i);
-		if(debug) dprintf(0, "sreg = %.2f\n", sreg);
 
-		switch(regker)
-		{
-			case 0:
-				regkh = ceil(3.0f * sreg * ss);
-				regkw = ceil(3.0f * sreg * ss);
-				break;
-			case 1:
-				regkh = ceil(sreg);
-				regkw = ceil(sreg);
-				break;
-			case 2:
-				regkh = ceil(sreg);
-				regkw = ceil(sreg);
-				break;
-			case 3:
-				regkh = ceil(sreg);
-				regkw = ceil(sreg);
-				break;
-			default:
-				break;
-		}
-		if(debug) dprintf(0, "sreg region for gpu: regkh = %i, regkw = %i\n", regkh, regkw);
-		
-		// Sigma regularization for local measure = sigma of local measure kernel by default
-		if(lmreg_ker_exp && !lmreg_s_exp)
-		{
-			lmreg_s = sl;
-		}
-		switch(lmreg_ker)
-		{
-			case 0:
-				lmreg_kh = ceil(3.0f * lmreg_s);
-				lmreg_kw = ceil(3.0f * lmreg_s);
-				break;
-			case 1:
-				lmreg_kh = ceil(lmreg_s);
-				lmreg_kw = ceil(lmreg_s);
-				break;
-			case 2:
-				lmreg_kh = ceil(lmreg_s);
-				lmreg_kw = ceil(lmreg_s);
-				break;
-			case 3:
-				lmreg_kh = ceil(lmreg_s);
-				lmreg_kw = ceil(lmreg_s);
-				break;
-			default:
-				break;
-		}	
-		if(debug) dprintf(0, "lmreg region for gpu: lmreg_kh = %i, lmreg_kw = %i\n", lmreg_kh, lmreg_kw);
-		switch(lweights)
-		{
-			// exponential weights
-			case 1:
-				lkh = ceil(3.0f * sl);
-				lkw = ceil(3.0f * sl);
-				break;
-			// circle characteristic weights
-			case 0:
-				lkh = ceil(3.0f * sl);
-				lkw = ceil(3.0f * sl);
-				break;
-			default:
-				lkh = ceil(3.0f * sl);
-				lkw = ceil(3.0f * sl);
-				break;
-		}
-		if(debug) dprintf(0, "lweights region for gpu: lkh = %i, lkw = %i\n", lkh, lkw);
-
-	if(debug) dprintf(0, "\nStarting SR loop ...");		
-	for(int i = 0; i < (int)srValues.size(); i++)
-	{		
-		type sr = srValues.at(i);
-		
-		// ************** PROCESS for given parameters ***************
-		
-		// Start convergence values over
-		for(int i = 0; i < (int)show_norm_list.size(); i++)
-		{
-			show_conv_values.at(i) = conv_eps_list.size();
-			conv_values.at(i) = conv_eps_list.size();	
-		}
-
-		for(int i = 0; i < (int)show_norm_list.size(); i++)
-		{
-			if(isInVector(conv_norm_list, show_norm_list.at(i)) < 0)
+			if(debug) dprintf(0, "Scaling input for scale = %.2f", scale);
+			for(int i = 0; i<valid_channels; i++)
 			{
-				conv_values.at(i) = 0;
+				scale_kernel<type><<<ggridsize, gblocksize>>>(dev_f + i * H * W, dev_temp + i * H * W,  scale, H, W);
+				gpuErrChk( cudaPeekAtLastError() );
 			}
-		}
+			std::swap(dev_f, dev_temp);
+			
+
+		// Loop for spatial sigma values (ss)
+		if(debug) dprintf(0, "\nStarting SS loop");
+		for(int i = 0; i < (int)ssValues.size(); i++)
+		{		
+			ss = ssValues.at(i);
+			if(debug) dprintf(0, "ss = %.2f\n", ss);
 		
+			if(!sl_exp) sl = ss;
+				
+			// Calculate size of regions
+			switch(sker)
+			{
+				case 0:
+					sskh = ceil(gaussian_neigh * ss);
+					sskw = ceil(gaussian_neigh * ss);
+					break;
+				case 1:
+					sskh = ceil(ss);
+					sskw = ceil(ss);
+					break;
+				case 2:
+					sskh = ceil(ss);
+					sskw = ceil(ss);
+					break;
+				case 3:
+					sskh = ceil(ss);
+					sskw = ceil(ss);
+					break;
+				case 4:
+					sskh = ceil(0.5f * M / ss);
+					sskw = ceil(0.5f * M / ss);
+				case 5:
+					sskh = ceil( 0.5f * M /  ss);
+					sskw = ceil( 0.5f * M / ss);
+					break;
+				default:
+					break;
+			}
+			if(debug) dprintf(0, "ss Region for gpu: sskh = %i, sskw = %i\n", sskw, sskw);
+		
+		// Loop for regularization values (fraction of ss)
+		if(debug) dprintf(0, "\nStarting SREG loop ...");		
+		for(int i = 0; i < sregValues.size(); i++)
+		{
+			sreg = sregValues.at(i);
+			if(debug) dprintf(0, "sreg = %.2f\n", sreg);
+
+			switch(regker)
+			{
+				case 0:
+					regkh = ceil(gaussian_neigh * sreg * ss);
+					regkw = ceil(gaussian_neigh * sreg * ss);
+					break;
+				case 1:
+					regkh = ceil(sreg);
+					regkw = ceil(sreg);
+					break;
+				case 2:
+					regkh = ceil(sreg);
+					regkw = ceil(sreg);
+					break;
+				case 3:
+					regkh = ceil(sreg);
+					regkw = ceil(sreg);
+					break;
+				default:
+					break;
+			}
+			if(debug) dprintf(0, "sreg region for gpu: regkh = %i, regkw = %i\n", regkh, regkw);
+			
+			// Sigma regularization for local measure = sigma of local measure kernel by default
+			if(lmreg_ker_exp && !lmreg_s_exp)
+			{
+				lmreg_s = sl;
+			}
+			switch(lmreg_ker)
+			{
+				case 0:
+					lmreg_kh = ceil(gaussian_neigh * lmreg_s);
+					lmreg_kw = ceil(gaussian_neigh * lmreg_s);
+					break;
+				case 1:
+					lmreg_kh = ceil(lmreg_s);
+					lmreg_kw = ceil(lmreg_s);
+					break;
+				case 2:
+					lmreg_kh = ceil(lmreg_s);
+					lmreg_kw = ceil(lmreg_s);
+					break;
+				case 3:
+					lmreg_kh = ceil(lmreg_s);
+					lmreg_kw = ceil(lmreg_s);
+					break;
+				default:
+					break;
+			}	
+			if(debug) dprintf(0, "lmreg region for gpu: lmreg_kh = %i, lmreg_kw = %i\n", lmreg_kh, lmreg_kw);
+			switch(lweights)
+			{
+				// exponential weights
+				case 1:
+					lkh = ceil(gaussian_neigh * sl);
+					lkw = ceil(gaussian_neigh * sl);
+					break;
+				// circle characteristic weights
+				case 0:
+					lkh = ceil(gaussian_neigh * sl);
+					lkw = ceil(gaussian_neigh * sl);
+					break;
+				default:
+					lkh = ceil(gaussian_neigh * sl);
+					lkw = ceil(gaussian_neigh * sl);
+					break;
+			}
+			if(debug) dprintf(0, "lweights region for gpu: lkh = %i, lkw = %i\n", lkh, lkw);
+
+		if(debug) dprintf(0, "\nStarting SR loop ...");		
+		for(int i = 0; i < (int)srValues.size(); i++)
+		{		
+			sr = srValues.at(i);
+			
+			// ************** PROCESS for given parameters ***************
+			
+			// Start convergence values over
+			for(int i = 0; i < (int)show_norm_list.size(); i++)
+			{
+				show_conv_values.at(i) = conv_eps_list.size();
+				conv_values.at(i) = conv_eps_list.size();	
+			}
+
+			for(int i = 0; i < (int)show_norm_list.size(); i++)
+			{
+				if(isInVector<std::string>(conv_norm_list, show_norm_list.at(i)) < 0)
+				{
+					conv_values.at(i) = 0;
+				}
+			}
+			
 		dprintf(0, "\n\n\tWorking for ss = %.2f, sr = %.2f, sreg = %.2f, scale = %.2f\n", ss, sr, sreg, scale);
 		if(save_log) fprintf(log_file, "\n\n\tWorking for ss = %.2f, sr = %.2f, scale = %.2f\n", ss, sr, scale);
 		
 		//Initialize dev_g according to conf
 		if(debug) dprintf(0, "\nIntializing dev_g in device (copying from g_host)... ");
-		cudaMemcpy(dev_g, host_g, nch_no_alpha * H * W * sizeof(type), cudaMemcpyHostToDevice);				
+		cudaMemcpy(dev_g, host_g, valid_channels * H * W * sizeof(type), cudaMemcpyHostToDevice);				
 		if(debug) dprintf(0, "done.");	
 	
 		// Perform iterations
 		bool run = true;
 		
-		int it = it_from;
-		
+		it = it_from;
+			
 		nit = 0;
 		if(it_list.size() > 0)
 			nit = it_list.at(maxInVector(it_list));
@@ -2180,6 +2531,7 @@ int main(int nargs, char** args){
 		// Run iterations
 		bool converged = false;
 		auto start = std::chrono::high_resolution_clock::now();
+		
 		while(run)
 		{
 			// Iteration info
@@ -2192,7 +2544,7 @@ int main(int nargs, char** args){
 			// host_g_last copies g data to calculate l2loc norm
 			if(calc_norms)
 			{
-				cudaMemcpy(dev_g_last, dev_g, H * W * nch_no_alpha * sizeof(type), cudaMemcpyDeviceToDevice);
+				cudaMemcpy(dev_g_last, dev_g, H * W * valid_channels * sizeof(type), cudaMemcpyDeviceToDevice);
 				gpuErrChk( cudaPeekAtLastError() );
 				cudaDeviceSynchronize();
 			}
@@ -2208,10 +2560,10 @@ int main(int nargs, char** args){
 				{
 					case 0:	// Max as local measure
 					
-						for(int i = 0; i < nch_no_alpha; i++)
+						for(int i = 0; i < valid_channels; i++)
 						{
 							// stdv is calculated in 3d using euclidean metric in rgb space
-							//subs_kernel_rgb<type><<<ggridsize, gblocksize>>>(dev_f, dev_g, devtemp, nch_no_alpha, H, W); -> dev_temp_i
+							//subs_kernel_rgb<type><<<ggridsize, gblocksize>>>(dev_f, dev_g, devtemp, valid_channels, H, W); -> dev_temp_i
 							subs_kernel<type><<<ggridsize, gblocksize>>>(dev_f + i * H * W, dev_g + i * H * W, dev_temp + i * H * W, H, W);
 							gpuErrChk( cudaPeekAtLastError() );
 							
@@ -2220,8 +2572,8 @@ int main(int nargs, char** args){
 							//gpuErrChk( cudaPeekAtLastError() );
 				
 						}
-						//centered_max_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_temp2, dev_stdev, H, W, nch_no_alpha, sl, lweights, lkh, lkw);
-						max_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_stdev, H, W, nch_no_alpha, sl, lweights, lkh, lkw);
+						//centered_max_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_temp2, dev_stdev, H, W, valid_channels, sl, lweights, lkh, lkw);
+						max_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_stdev, H, W, valid_channels, sl, lweights, lkh, lkw);
 						gpuErrChk( cudaPeekAtLastError() );						
 						cudaDeviceSynchronize();
 						
@@ -2229,10 +2581,10 @@ int main(int nargs, char** args){
 			
 					case 1:	// Mean as local measure
 					
-						for(int i = 0; i < nch_no_alpha; i++)
+						for(int i = 0; i < valid_channels; i++)
 						{
 							// stdv is calculated in 3d using euclidean metric in rgb space
-							//subs_kernel_rgb<type><<<ggridsize, gblocksize>>>(dev_f, dev_g, devtemp, nch_no_alpha, H, W); -> dev_temp_i
+							//subs_kernel_rgb<type><<<ggridsize, gblocksize>>>(dev_f, dev_g, devtemp, valid_channels, H, W); -> dev_temp_i
 							subs_kernel<type><<<ggridsize, gblocksize>>>(dev_f + i * H * W, dev_g + i * H * W, dev_temp + i * H * W, H, W);
 							gpuErrChk( cudaPeekAtLastError() );
 							
@@ -2241,8 +2593,8 @@ int main(int nargs, char** args){
 							//gpuErrChk( cudaPeekAtLastError() );
 				
 						}
-						mean_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_stdev, H, W, nch_no_alpha, sl, lweights, lkh, lkw);
-						//centered_mean_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_temp2, dev_stdev, H, W, nch_no_alpha, sl, lweights, lkh, lkw);
+						mean_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_stdev, H, W, valid_channels, sl, lweights, lkh, lkw);
+						//centered_mean_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_temp2, dev_stdev, H, W, valid_channels, sl, lweights, lkh, lkw);
 						gpuErrChk( cudaPeekAtLastError() );						
 						cudaDeviceSynchronize();
 						
@@ -2252,10 +2604,10 @@ int main(int nargs, char** args){
 					
 					default: // 2 or default: Standard deviation as local measure
 					
-						for(int i = 0; i < nch_no_alpha; i++)
+						for(int i = 0; i < valid_channels; i++)
 						{
 							// stdv is calculated in 3d using euclidean metric in rgb space
-							//subs_kernel_rgb<type><<<ggridsize, gblocksize>>>(dev_f, dev_g, devtemp, nch_no_alpha, H, W); -> dev_temp_i
+							//subs_kernel_rgb<type><<<ggridsize, gblocksize>>>(dev_f, dev_g, devtemp, valid_channels, H, W); -> dev_temp_i
 							subs_kernel<type><<<ggridsize, gblocksize>>>(dev_f + i * H * W, dev_g + i * H * W, dev_temp + i * H * W, H, W);
 							gpuErrChk( cudaPeekAtLastError() );
 							
@@ -2273,11 +2625,11 @@ int main(int nargs, char** args){
 							// local_measure 0 = max 1 = mean 2 = stdev
 				
 						}
-						sum_channels_kernel<type><<<ggridsize, gblocksize>>>(dev_temp2, dev_stdev, H, W, nch_no_alpha);
+						sum_channels_kernel<type><<<ggridsize, gblocksize>>>(dev_temp2, dev_stdev, H, W, valid_channels);
 						gpuErrChk( cudaPeekAtLastError() );
 						
 						// Normalize
-						scale_in_place_kernel<type><<<ggridsize, gblocksize>>>(dev_stdev, 1.0 / ((type)nch_no_alpha), H, W);
+						scale_in_place_kernel<type><<<ggridsize, gblocksize>>>(dev_stdev, 1.0 / ((type)valid_channels), H, W);
 						gpuErrChk( cudaPeekAtLastError() );
 
 						sqrt_in_place_kernel<type><<<ggridsize, gblocksize>>>(dev_stdev, H, W);
@@ -2317,8 +2669,10 @@ int main(int nargs, char** args){
 				dprintf(0, "reg ");
 				if(save_log) fprintf(log_file, "reg ");
 
-				for(int i = 0; i<nch_no_alpha; i++){			
-					convolution_kernel<type><<<dim3(ceil((type)W/blockConvW), ceil((type)H/blockConvH), 1), dim3(blockConvW, blockConvH,1)>>>(dev_g + i * H * W, dev_temp + i * H * W,  H, W, sreg * ss , regker, regkh, regkw);
+				for(int ch = 0; ch<valid_channels; ch++)
+				{	
+					trilateral_kernel_rgb<type><<<dim3(ceil((type)W/blockConvW), ceil((type)H/blockConvH), 1), dim3(blockConvW, blockConvH,1)>>>(dev_g + ch * H * W, NULL, dev_temp + ch * H * W, 0, H, W, domain_extension, sreg * ss, 0, 0, regker, -1, -1, regkh, regkw);		
+					//convolution_kernel<type><<<dim3(ceil((type)W/blockConvW), ceil((type)H/blockConvH), 1), dim3(blockConvW, blockConvH,1)>>>(dev_g + i * H * W, dev_temp + i * H * W,  H, W, sreg * ss , regker, regkh, regkw);
 					gpuErrChk( cudaPeekAtLastError() );
 				}
 				std::swap(dev_g, dev_temp);
@@ -2328,24 +2682,23 @@ int main(int nargs, char** args){
 			
 			// Joint Bilateral Filter
 			dprintf(0, "b\t");
-			for(int i = 0; i<nch_no_alpha; i++)
+			for(int ch = 0; ch<valid_channels; ch++)
 			{	
 				type* devf = dev_f;
-				if(conf == 3)
+				if(conf == CONF_BIL)
 				{
 					// Bilateral algorithm do not work on original f
 					devf = dev_g;
 				}
 				if (adaptive)
 				{
-					trilateral_kernel_rgb<type><<<dim3(ceil((type)(W)/blockBilW), ceil((type)(H)/blockBilH),1), dim3(blockBilW, blockBilH,1)>>>(devf + i * H * W, dev_g, dev_temp + i * H * W, nch_no_alpha, H, W, ss, sr / sr_ref, dev_stdev, infsr, sm, sker, rker, mker, sskh, sskw);
+					trilateral_kernel_rgb<type><<<dim3(ceil((type)(W)/blockBilW), ceil((type)(H)/blockBilH),1), dim3(blockBilW, blockBilH,1)>>>(devf + ch * H * W, dev_g, dev_temp + ch * H * W, valid_channels, H, W, domain_extension, ss, sr / sr_ref, dev_stdev, infsr, sm, sker, rker, mker, sskh, sskw);
 				}
 				else
 				{
-					trilateral_kernel_rgb<type><<<dim3((int)(W/blockBilW) + 1, (int)(H/blockBilH) + 1,1), dim3(blockBilW, blockBilH,1)>>>(devf + i * H * W, dev_g, dev_temp + i * H * W, nch_no_alpha, H, W, ss, sr * f_range, sm, sker, rker, mker, sskh, sskw);
+					trilateral_kernel_rgb<type><<<dim3((int)(W/blockBilW) + 1, (int)(H/blockBilH) + 1,1), dim3(blockBilW, blockBilH,1)>>>(devf + ch * H * W, dev_g, dev_temp + ch * H * W, valid_channels, H, W, domain_extension, ss, sr * f_range, sm, sker, rker, mker, sskh, sskw);
 				}
-				gpuErrChk( cudaPeekAtLastError() );	
-		
+				gpuErrChk( cudaPeekAtLastError() );		
 			}
 			// dev_g to store output:
 			std::swap(dev_g, dev_temp);
@@ -2364,7 +2717,7 @@ int main(int nargs, char** args){
 					if(norm_string.compare("l2") == 0)
 					{
 						// Calculate values
-						dist2_rgb_kernel<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, nch_no_alpha);
+						dist2_rgb_kernel<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, valid_channels);
 						gpuErrChk( cudaPeekAtLastError() );
 						
 						// copy this values to host to calculate max value
@@ -2379,7 +2732,7 @@ int main(int nargs, char** args){
 					else if(norm_string.compare("l2loc") == 0)
 					{
 						// Calculate L2loc norm between last and current iteration	and stores in dev_temp (first channel)			
-						l2loc2_kernel_rgb<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, nch_no_alpha, sskh, sskw);
+						l2loc2_kernel_rgb<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, valid_channels, sskh, sskw);
 						gpuErrChk( cudaPeekAtLastError() );
 						// copy this values to host to calculate max value
 						if(debug) dprintf(0, "\nDev to Host to check stopping criteria:");				
@@ -2391,8 +2744,8 @@ int main(int nargs, char** args){
 					}
 					else if(norm_string.compare("max") == 0)
 					{
-						l2loc2_kernel_rgb<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, nch_no_alpha, 0, 0);
-						//dist2_rgb_kernel<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, nch_no_alpha);
+						l2loc2_kernel_rgb<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, valid_channels, 0, 0);
+						//dist2_rgb_kernel<type><<<dim3(ceil((type)W/blockBilW), ceil((type)H/blockBilH), 1), dim3(blockBilW, blockBilH,1)>>>(dev_g, dev_g_last, dev_temp, H, W, valid_channels);
 						gpuErrChk( cudaPeekAtLastError() );
 						
 						// copy this values to host to calculate max value
@@ -2410,7 +2763,7 @@ int main(int nargs, char** args){
 					if(show_conv_values.at(i) > 0)
 					{
 						type eps = conv_eps_list.at(show_conv_values.at(i) -1 );
-						if( norm_val <= eps * eps * nch_no_alpha)
+						if( norm_val <= eps * eps * valid_channels)
 						{	
 							dprintf(0, "\n * Convergence at Iteration %i with %s = %.16f for eps = %.8f\n", it, norm_string.data(), sqrt(norm_val), eps);
 							if(save_log) fprintf(log_file, "\n * Convergence at Iteration %i with %s = %.16f for eps = %.16f\n", it, norm_string.data(), sqrt(norm_val), eps);
@@ -2440,7 +2793,7 @@ int main(int nargs, char** args){
 			{
 				print_it = true;
 			}
-			else if(it > 0 && isInVector(it_list, it, 0) >= 0)
+			else if(it > 0 && isInVector<int>(it_list, it, 0) >= 0)
 			{
 				if (debug) dprintf(0, "\nIteration %i is in printing vector.", it);
 				print_it = true;
@@ -2456,81 +2809,183 @@ int main(int nargs, char** args){
 			{
 				auto stop = std::chrono::high_resolution_clock::now();
 				auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-				dprintf(0,"\tExecution time:\t%ld microseconds\n", duration.count());		
-				// Make output generic name
-				std::string out_name = output_name;
-
-				// Add adapt_sr info to RGF
-				if(adapt_sr && adaptive == false)
-				{
-					out_name += "_asr";
-				}
-
-				if(rker_exp)
-				{
-					out_name += "-rker-" + get_ker_name(rker);
-				}
-				if(sr > 0)
-				{
-					out_name += "-sr-" +  Patch::to_string_f(sr, 2);
-				}
-				if(sker_exp)
-				{
-					out_name += "-sker-" + get_ker_name(sker);
-				}		
-				if(ss > 0)
-				{
-					if(xic_exp == false)
-					{
-						out_name += "-ss-" +  Patch::to_string_f(ss, 2);
-					}
-					else
-					{
-						out_name += "xic_1_" + Patch::to_string_f(ss / calibration_xicxss,2);
-					}
-				}
-				if(sreg_exp) out_name += "-sreg_" + Patch::to_string_f(sreg, 2);
-				// Add Adaptive Filter info
-				if (adaptive)
-				{
-					out_name += "-lm_" + get_lm_name(local_measure);
-					out_name += "_" + get_w_name(lweights) + "_" + Patch::to_string_f(sl, 2);
+				dprintf(0,"\tExecution time:\t%ld microseconds\n", duration.count());	
 				
-					if(lmreg_ker_exp)
-					{
-						out_name += "-lmreg_" + get_ker_name(lmreg_ker) + "_" + Patch::to_string_f(lmreg_s, 2);
-					}
-				}
-				
-				// Add iteration info
-				out_name += "-nit-" + Patch::to_string(it);
-
-				// Add scaling info
-				if (scale_exp)
-				{
-					out_name += "-scale" ;
-					if (scale_back)
-					{
-						out_name += "_sb";
-					}
-					out_name += "-" + Patch::to_string_f(scale, 2);
-				}
-				
-				// Add infsr info
-				if(infsr_exp == true)
-				{
-					out_name += "-infsr_" + Patch::to_string_f(infsr, 2);
-				}
-				
-				// Copy back to Host
-				if(debug) dprintf(0, "\nGetting back result to host ... ");
-				for(int i = 0; i < nch_no_alpha; i++)
+				// Copy back result of iteration to Host en host_temp
+				if (debug) dprintf(0, "\nGetting back result to host , valid_channels = %d... ", valid_channels);
+				for(int ch = 0; ch < valid_channels; ch++)
 				{		
-					cudaMemcpy( host_temp + i * H * W, dev_g + i * H * W, H * W * sizeof(type), cudaMemcpyDeviceToHost );
+					cudaMemcpy( host_temp + ch * H * W, dev_g + ch * H * W, H * W * sizeof(type), cudaMemcpyDeviceToHost );
 					gpuErrChk( cudaPeekAtLastError() );
 					
 				}
 
+				// Make output generic name
+				std::string out_name = output_name;
+
+				make_output_name(&out_name);
+
+				// Print iteration result with GAMMA correction
+				if(print_gamma)
+				{
+					dprintf(0, "\nPrinting iteration %d with GAMMA	correction ...", it);
+					std::string final_output_file_name = out_name + get_im_format(output_format);
+					//unsigned char* p = pixels;
+					unsigned char * pixels = new unsigned char[H * W * nchannels];
+					
+					unsigned char *p = pixels;
+					for(int i = 0; i< H*W; i++)
+					{
+						//Change first color channels
+						for(int ch = 0; ch < valid_channels; ch ++){
+							type val = ((type)(host_temp[ch * H * W + i]));
+							
+							if(scale_back)
+								val = val / scale;
+							
+							val = Matrix::apply_gamma<type>(val);
+
+							*p = (unsigned char)(val * 255);
+							p++;
+						}
+						//Skip possible alpha channel (last channel)
+						for(int ch = valid_channels; ch < nchannels; ch ++){
+							*p = 0;
+							p++;
+						}
+					}
+					if(debug) dprintf(0, "done.");
+
+					// Save PNG image
+					write_png(final_output_file_name, pixels, H, W, nchannels, 8, debug);
+					dprintf(0, "\n\t > %s", final_output_file_name.data());
+					if(save_log)
+					{
+						fprintf(log_file, "\n\t > %s", final_output_file_name.data());
+					}
+					delete[] pixels;
+				}
+
+				// If we want to print linear space and default ouput was not in linear space
+				if(print_linear)
+				{
+					dprintf(0, "\nPrinting iteration %d in LINEAR space ...", it);
+					std::string final_output_file_name = out_name + "-linear.png";
+					unsigned char *pixels = new unsigned char[H * W * nchannels];
+					unsigned char* p = pixels;
+					for(int i = 0; i< H*W; i++)
+					{
+						//Change first color channels
+						for(int ch = 0; ch < valid_channels; ch ++){
+							type val = ((type)(host_temp[ch * H * W + i]));
+							
+							if(scale_back)
+								val = val / scale;
+							*p = (unsigned char)(val * RGB_REF);
+							p++;
+						}
+						//Skip possible alpha channel (last channel)
+						for(int ch = valid_channels; ch < nchannels; ch ++){
+							*p = 0;
+							p++;
+						}
+					}
+
+					// Save PNG image
+					dprintf(0, "\nOUTPUT PNG in LINEAR space ...");
+					write_png(final_output_file_name, pixels, H, W, nchannels, 8, debug);
+					dprintf(0, " \n\t > %s", final_output_file_name.data());
+					
+					if(save_log)
+					{
+						fprintf(log_file, "\n\t > %s", final_output_file_name.data());
+					}
+					delete[] pixels;
+				}
+
+				// HDR TONE MAPPING: make back RGB and print it
+				if(make_hdr_tone_mapping)
+				{
+					dprintf(0, "\nMaking Tone Mapping ...");
+					std::string output_tm_name = out_name + "-TONE_MAPPED.png";
+					
+					if(input_format == IMAGE_HDR)
+					{
+						int output_nchannels = 3;
+						type * host_output = new type[H * W * output_nchannels ];
+						int output_rgb_format = MATRIX_RGB_TYPE_CHUNK;
+						switch(f_rgb_format)
+						{
+							case MATRIX_RGB_TYPE_INTER:
+								for(int i = 0; i < H * W; i++)
+								{
+									for(int c = 0; c < output_nchannels; c++)
+									{		
+										host_output[i + c * H * W] = (type)((double)host_input_f[3 * i + c] * exp( (double)0.25f * log((double)host_temp[i] + (double)0.00001)  + log((double)host_f[i] + 0.0001) - log( (double)host_temp[i] + (double)0.0001) ) / (double)host_f[i] );
+									}							
+								}
+								break;
+							case MATRIX_RGB_TYPE_CHUNK:
+								for(int i = 0; i < H * W; i++)
+								{
+									for(int c = 0; c < output_nchannels; c++)
+									{	
+										host_output[i + c * H * W] = (type)((double)host_input_f[i + c * H * W] * exp( (double)0.25f * log((double)host_temp[i] + (double)0.00001)  + log((double)host_f[i] + 0.0001) - log( (double)host_temp[i] + (double)0.0001) ) / (double)host_f[i] );
+									}															
+								}
+							break;
+						}
+
+						// Calculate min value to correct bias
+						type min_val = host_output[0];
+						for(int i = 0; i < H * W * output_nchannels ; i++)
+						{
+							min_val = min(min_val, host_output[i]);
+						}
+						
+						// Correc bias
+						for(int i = 0; i < H * W * output_nchannels; i++)
+						{
+							host_output[i] -= min_val;
+							host_output[i] *= 0.45;
+						}
+						
+						dprintf(0, "\nPrinting TONE MAPPED PNG with GAMMA correction ...");
+
+						/*unsigned char *pixels = new unsigned char[H * W * output_nchannels];
+						unsigned char* p = pixels;
+						for(int i = 0; i< H*W; i++)
+						{
+							//Change first color channels
+							for(int ch = 0; ch < output_nchannels; ch ++){
+								type val = ((type)(host_temp[ch * H * W + i]));
+								
+								if(scale_back)
+									val = val / scale;
+								*p = (unsigned char)(val * RGB_REF);
+								p++;
+							}
+						}*/
+
+						// Apply gamma
+						Matrix::apply_gamma<type>(host_output, host_output, H * W * output_nchannels);
+
+						write_png_float<type>(output_tm_name, host_output, H, W, output_nchannels, 8, debug);
+						dprintf(0, "\n\t > %s", output_tm_name.data());
+
+						if(save_log)
+						{
+							fprintf(log_file, "\n\t > %s\n", output_tm_name.data());
+						}
+
+						//delete[] pixels;
+						delete[] host_output;
+						//delete[] host_detail;
+
+					}
+
+				}
+				// Print TXT local measure
 				if(adaptive && (txt_local_measure || print_local_measure_gamma || print_local_measure_linear))
 				{
 					cudaMemcpy(host_local_measure, dev_stdev, H * W * sizeof(type), cudaMemcpyDeviceToHost);
@@ -2555,7 +3010,8 @@ int main(int nargs, char** args){
 					dprintf(0, "\n\t> %s saved.", file_name.data());
 				}
 				if(debug) dprintf(0, "done.\n");
-				// Print local measure to png with gamma correction
+
+				// Print PNG LOCAL MEASURE with gamma correction
 				if(adaptive && print_local_measure_gamma)
 				{
 					dprintf(0, "\nPrinting LOCAL MEASURE with GAMMA correction ...");
@@ -2579,7 +3035,7 @@ int main(int nargs, char** args){
 					}
 					if(debug) dprintf(0, "done.\n");
 					
-					save_image(file_name.data(), pixels, H, W, 1, 0, 8);
+					write_png(file_name, pixels, H, W, 1, 8, debug);
 					dprintf(0, "\n\t> %s saved.", file_name.data());
 					if(save_log)
 					{
@@ -2588,7 +3044,7 @@ int main(int nargs, char** args){
 					delete[] pixels;
 				
 				}
-				
+				// Print LOCAL MEASURE in LINEAR space
 				if(adaptive && print_local_measure_linear)
 				{
 					// Save PNG image
@@ -2609,7 +3065,7 @@ int main(int nargs, char** args){
 					if(debug) dprintf(0, "done.\n");
 
 					
-					save_image(file_name.data(), pixels, H, W, 1, 0, 8);
+					write_png(file_name, pixels, H, W, 1, 8, debug);
 					dprintf(0, "\n\t> %s saved.", file_name.data());
 					if(save_log)
 					{
@@ -2617,86 +3073,6 @@ int main(int nargs, char** args){
 					}
 					delete[] pixels;
 				
-				}
-				
-				//Copy to pixel buffer applying gamma correction and other stuff
-				if(debug) dprintf(0, "\nCopy new data to pixels buffer applying back gamma correction... ");
-				
-				if(print_gamma)
-				{
-					dprintf(0, "Printing iteration %d", it);
-					std::string file_name = out_name + ".png";
-					//unsigned char* p = pixels;
-					//unsigned char * pix = new unsigned char[H * W * nchannels];
-					unsigned char *p = pixels;
-					for(int i = 0; i< H*W; i++)
-					{
-						//Change first color channels
-						for(int ch = 0; ch < nch_no_alpha; ch ++){
-							type val = ((type)(host_temp[ch * H * W + i]));
-							
-							if(scale_back)
-								val = val / scale;
-							
-							if(val <= 0.0031308)
-								val = 12.92 * val;
-							else
-								val = 1.055 * pow( val, 1.0/2.4 ) - 0.055;
-							*p = (unsigned char)(val * RGB_REF);
-							p++;
-						}
-						//Skip possible alpha channel (last channel)
-						for(int ch = nch_no_alpha; ch < nchannels; ch ++){
-							p++;
-						}
-					}
-					if(debug) dprintf(0, "done.\n");
-
-					// Save PNG image
-					dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
-					save_image(file_name.data(), pixels, H, W, nchannels, color_type, bit_depth);
-					dprintf(0, "\n > %s saved.", file_name.data());
-					if(save_log)
-					{
-						fprintf(log_file, "\n > %s saved.", file_name.data());
-					}
-					//delete[] pix;
-				}
-
-				
-				// If we want to print linear space and default ouput was not in linear space
-				if(print_linear)
-				{
-					std::string file_name = out_name + "-linear.png";
-					//unsigned char *pix = new unsigned char[H * W * nchannels];
-					unsigned char* p = pixels;
-					for(int i = 0; i< H*W; i++)
-					{
-						//Change first color channels
-						for(int ch = 0; ch < nch_no_alpha; ch ++){
-							type val = ((type)(host_temp[ch * H * W + i]));
-							
-							if(scale_back)
-								val = val / scale;
-							*p = (unsigned char)(val * RGB_REF);
-							p++;
-						}
-						//Skip possible alpha channel (last channel)
-						for(int ch = nch_no_alpha; ch < nchannels; ch ++){
-							p++;
-						}
-					}
-
-					// Save PNG image
-					dprintf(0, "\nOUTPUT PNG in LINEAR space ...");
-					save_image(file_name.data(), pixels, H, W, nchannels, color_type, bit_depth);
-					dprintf(0, " \n > %s saved.\n", file_name.data());
-					
-					if(save_log)
-					{
-						fprintf(log_file, "\n%s saved.", file_name.data());
-					}
-					//delete[] pix;
 				}
 				
 				// Print diffs with input to png
@@ -2709,7 +3085,7 @@ int main(int nargs, char** args){
 					for(int i = 0; i< H*W; i++)
 					{
 						//Change first color channels
-						for(int ch = 0; ch < nch_no_alpha; ch ++){
+						for(int ch = 0; ch < valid_channels; ch ++){
 							type val = abs((host_temp[ch * H * W + i] - host_f[ch * H * W + i]));
 							
 							if(scale_back)
@@ -2724,7 +3100,7 @@ int main(int nargs, char** args){
 							p++;
 						}
 						//Skip possible alpha channel (last channel)
-						for(int ch = nch_no_alpha; ch < nchannels; ch ++){
+						for(int ch = valid_channels; ch < nchannels; ch ++){
 							p++;
 						}
 					}
@@ -2732,7 +3108,7 @@ int main(int nargs, char** args){
 
 					// Save PNG image
 					dprintf(0, "\nPrinting DIFF PNG with GAMMA correction ... \n");
-					save_image(file_name.data(), pixels, H, W, nchannels, color_type, bit_depth);
+					write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
 					dprintf(0, "\n\t > %s saved.\n", file_name.data());
 					if(save_log)
 					{
@@ -2741,7 +3117,6 @@ int main(int nargs, char** args){
 					//delete[] pix;
 				}
 
-				
 				// If we want to print linear space and default ouput was not in linear space
 				if(print_diff_linear)
 				{
@@ -2751,7 +3126,7 @@ int main(int nargs, char** args){
 					for(int i = 0; i< H*W; i++)
 					{
 						//Change first color channels
-						for(int ch = 0; ch < nch_no_alpha; ch ++){
+						for(int ch = 0; ch < valid_channels; ch ++){
 							type val = abs(host_temp[ch * H * W + i] - host_f[ch * H * W + i]);
 							
 							if(scale_back)
@@ -2760,19 +3135,19 @@ int main(int nargs, char** args){
 							p++;
 						}
 						//Skip possible alpha channel (last channel)
-						for(int ch = nch_no_alpha; ch < nchannels; ch ++){
+						for(int ch = valid_channels; ch < nchannels; ch ++){
 							p++;
 						}
 					}
 
 					// Save PNG image
 					dprintf(0, "Printing DIFF PNG in LINEAR SPACE ...\n");
-					save_image(file_name.data(), pixels, H, W, nchannels, color_type, bit_depth);
-					dprintf(0, "\n\t > %s saved.\n", file_name.data());
+					write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
+					dprintf(0, "\n\t > %s", file_name.data());
 					
 					if(save_log)
 					{
-						fprintf(log_file, "%s saved.\n", file_name.data());
+						fprintf(log_file, "\n\t > %s", file_name.data());
 					}
 					//delete[] pix;
 				}	
@@ -2789,11 +3164,11 @@ int main(int nargs, char** args){
 					{
 						type sum = 0;
 						//Change first color channels
-						for(int ch = 0; ch < nch_no_alpha; ch ++){
+						for(int ch = 0; ch < valid_channels; ch ++){
 							type val = abs((host_temp[ch * H * W + i] - host_f[ch * H * W + i]));
 							sum += val * val;	
 						}
-						sum = sqrt(sum / nch_no_alpha);
+						sum = sqrt(sum / valid_channels);
 						if(scale_back)
 								sum = sum / scale;
 						
@@ -2810,7 +3185,7 @@ int main(int nargs, char** args){
 
 					// Save PNG image
 					dprintf(0, "\nPrinting DIFF SINGLE image with GAMMA correction ...");
-					save_image(file_name.data(), pixels, H, W, 1, 0, 8);
+					write_png(file_name, pixels, H, W, 1, 8, debug);
 					dprintf(0, "\n\t > %s saved.", file_name.data());
 					if(save_log)
 					{
@@ -2819,7 +3194,6 @@ int main(int nargs, char** args){
 					delete[] pixels;
 				}
 
-				
 				if(print_diff_single_linear)
 				{
 					std::string file_name = out_name + "-diff_single_linear.png";
@@ -2831,11 +3205,11 @@ int main(int nargs, char** args){
 					{
 						type sum = 0;
 						//Change first color channels
-						for(int ch = 0; ch < nch_no_alpha; ch ++){
+						for(int ch = 0; ch < valid_channels; ch ++){
 							type val = abs((host_temp[ch * H * W + i] - host_f[ch * H * W + i]));	
 							sum += val * val;	
 						}
-						sum = sqrt(sum / nch_no_alpha);
+						sum = sqrt(sum / valid_channels);
 						if(scale_back)
 								sum = sum / scale;
 						*p = (unsigned char)(sum * RGB_REF);
@@ -2845,7 +3219,7 @@ int main(int nargs, char** args){
 
 					// Save PNG image
 					dprintf(0, "\nPrinting DIFF SINGLE image in LINEAR space ...");
-					save_image(file_name.data(), pixels, H, W, 1, 0, 8);
+					write_png(file_name, pixels, H, W, 1, 8, debug);
 					dprintf(0, "\n%s saved.", file_name.data());
 					if(save_log)
 					{
@@ -2854,16 +3228,15 @@ int main(int nargs, char** args){
 					delete[] pixels;
 				}	
 				
-				
 				// Save txt version if wanted
 				if (save_txt)
 				{
-					dprintf(0, "Saving TXT version in LINEAR space. It could generate a heavy file. Alpha channel will NOT be saved.");
-					printToTxt((out_name + ".txt").data(), host_temp, H, W, nch_no_alpha);	
-					dprintf(0, "\n%s saved.", (out_name + ".txt").data());
+					dprintf(0, "\nSaving TXT version in LINEAR space. It could generate a heavy file. Alpha channel will NOT be saved.");
+					std::string final_output_name = out_name;
+					Util::printToTxt<type>(final_output_name, host_temp, H, W, valid_channels);
 					if(save_log)
 					{
-						fprintf(log_file, "\n%s saved.\n", (out_name + ".txt").data());
+						fprintf(log_file, "\n\t > %s", (final_output_name).data());
 					}
 				}
 				
@@ -2875,17 +3248,17 @@ int main(int nargs, char** args){
 						int i = h_slice_list.at(index);
 						std::string slice_file_name = out_name + "-hslice_" + Patch::to_string(i) + ".txt";
 						FILE *slice_file = fopen(slice_file_name.data(), "w");
-						 
+						
 						for(int j = 0; j < W; j++)
 						{
-							for(int ch = 0; ch < nch_no_alpha; ch ++)
+							for(int ch = 0; ch < valid_channels; ch ++)
 							{
 								fprintf(slice_file, "%.8f\t", host_temp[ch * W * H + i * W + j]);
 							}
 							fprintf(slice_file, "\n");
 						}
 						fclose(slice_file);
-						dprintf(0, "\nH SLICE %d saved in %s.", i, (slice_file_name ).data());						
+						dprintf(0, "\n\tH SLICE %d saved in %s.", i, (slice_file_name ).data());						
 					}
 				}
 				
@@ -2896,17 +3269,17 @@ int main(int nargs, char** args){
 						int j = v_slice_list.at(index);
 						std::string slice_file_name = out_name + "-vslice_" + Patch::to_string(j) + ".txt";
 						FILE *slice_file = fopen(slice_file_name.data(), "w");
-						 
+						
 						for(int i = 0; i < W; i++)
 						{
-							for(int ch = 0; ch < nch_no_alpha; ch ++)
+							for(int ch = 0; ch < valid_channels; ch ++)
 							{
 								fprintf(slice_file, "%.8f\t", host_temp[ch * W * H + i * W + j]);
 							}
 							fprintf(slice_file, "\n");
 						}
 						fclose(slice_file);
-						dprintf(0, "\nV SLICE %d saved in %s.", j, (slice_file_name ).data());						
+						dprintf(0, "\n\tV SLICE %d saved in %s.", j, (slice_file_name ).data());						
 					}
 				}
 				
@@ -2921,7 +3294,7 @@ int main(int nargs, char** args){
 						for(int i = 0; i< H*W; i++)
 						{
 							//Change first color channels
-							for(int ch = 0; ch < nch_no_alpha; ch ++){
+							for(int ch = 0; ch < valid_channels; ch ++){
 								int ind = ch * H * W + i;
 								type val = host_temp[ind] + ce_factor * ( host_f[ind] - host_temp[ind]) ;
 								if(val < 0) val = 0.0;
@@ -2937,7 +3310,7 @@ int main(int nargs, char** args){
 								p++;
 							}
 							//Skip possible alpha channel (last channel)
-							for(int ch = nch_no_alpha; ch < nchannels; ch ++){
+							for(int ch = valid_channels; ch < nchannels; ch ++){
 								p++;
 							}
 						}
@@ -2945,7 +3318,7 @@ int main(int nargs, char** args){
 
 						// Save PNG image
 						dprintf(0, "\n Printing CONTRAST ENHANCEMENT PNG with GAMMA correction ...");
-						save_image(file_name.data(), pixels, H, W, nchannels, color_type, bit_depth);
+						write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
 						dprintf(0, "\n > %s saved.", file_name.data());
 						if(save_log)
 						{
@@ -2966,7 +3339,7 @@ int main(int nargs, char** args){
 						for(int i = 0; i< H*W; i++)
 						{
 							//Change first color channels
-							for(int ch = 0; ch < nch_no_alpha; ch ++){
+							for(int ch = 0; ch < valid_channels; ch ++){
 								int ind = ch * H * W + i;
 								type val = host_temp[ind] + ce_factor * ( host_f[ind] - host_temp[ind]) ;
 								
@@ -2976,7 +3349,7 @@ int main(int nargs, char** args){
 								p++;
 							}
 							//Skip possible alpha channel (last channel)
-							for(int ch = nch_no_alpha; ch < nchannels; ch ++){
+							for(int ch = valid_channels; ch < nchannels; ch ++){
 								p++;
 							}
 						}
@@ -2984,7 +3357,7 @@ int main(int nargs, char** args){
 
 						// Save PNG image
 						dprintf(0, "\n Printing CONTRAST ENHANCEMENT PNG in LINEAR space ...");
-						save_image(file_name.data(), pixels, H, W, nchannels, color_type, bit_depth);
+						write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
 						dprintf(0, "\n > %s saved.", file_name.data());
 						if(save_log)
 						{
@@ -3004,74 +3377,35 @@ int main(int nargs, char** args){
 			if (converged && force_stop_on_convergence) run = false;	// if force-stop we dont want to go on after convergence
 		}
 
-	}
-	}
-	}
-	}
-	
-	printf("\n");
+		}
+		}
+		}
+		}
 
-	
-	if(debug) dprintf(0, "Cleaning memory in host ... ");
-	delete[] host_f;
-	delete[] host_g;
-	delete[] pixels;
-	delete[] gpixels;
-	delete[] host_temp;
-	delete[] host_local_measure;
-	if(debug) dprintf(0, "done.\n");
-	
-	if(debug) dprintf(0, "Cleaning memory in device ... ");
-	cudaFree(dev_f);
-	cudaFree(dev_g);
-	cudaFree(dev_g_last);
-	cudaFree(dev_stdev);
-	cudaFree(dev_temp);
-	cudaFree(dev_temp2);
-	if(debug) dprintf(0, "done\n");
+		if(debug) dprintf(0, "Cleaning memory in host ... ");
+		delete[] host_f;
+		delete[] host_g;
+		delete[] pixels;
+		delete[] gpixels;
+		delete[] host_temp;
+		delete[] host_local_measure;
+		if(debug) dprintf(0, "done.\n");
+		
+		if(debug) dprintf(0, "Cleaning memory in device ... ");
+		cudaFree(dev_f);
+		cudaFree(dev_g);
+		cudaFree(dev_g_last);
+		cudaFree(dev_stdev);
+		cudaFree(dev_temp);
+		cudaFree(dev_temp2);
+		if(debug) dprintf(0, "done\n");
+	}
 	
 	if(save_log)
 		fclose(log_file);
 	
+	printf("\n");
 	return 1;
 	
-
-}
-
-
-
-// Function to print png, still not usable
-void print_png(type *host_g, std::string out_name, int H, int W, int nchannels_no_alpha, int nchannels,  int color_type, int bit_depth, bool gammacor, type scale)
-{
-	unsigned char *pixels = new unsigned char[H * W * nchannels_no_alpha];
-	//Copy to pixel buffer applying gamma correction and other stuff
-	unsigned char* p = pixels;
-	for(int i = 0; i< H*W; i++)
-	{
-		//Change first color channels
-		for(int ch = 0; ch < nchannels_no_alpha; ch ++){
-			type val = ((type)(host_g[ch * H * W + i]));
-			
-			val = val / scale;
-			
-			if(gammacor){
-				if(val <= 0.0031308)
-					val = 12.92 * val;
-				else
-					val = 1.055 * pow( val, 1.0/2.4 ) - 0.055;
-			}
-			*p = (unsigned char)(val * (pow(2, bit_depth) -1));
-			p++;
-		}
-		//Skip possible alpha channel (last channel)
-		for(int ch = nchannels_no_alpha; ch < nchannels; ch ++){
-			p++;
-		}
-	}
-
-	// Save PNG image
-	save_image(out_name.data(), pixels, H, W, nchannels, color_type, bit_depth);
-	printf("%s saved.\n", out_name.data());
-	free(pixels);
 }
 
