@@ -16,7 +16,7 @@ namespace Matrix
 	/* Input : RGB[3 * H * W], Output: Single [H * W]*/
 	template<typename type> int RGB_to_Gray(type *in, type *out, int length, int nchannels = 3, int rgb_format = MATRIX_RGB_TYPE_INTER)
 	{
-		if(nchannels == 3)	// RGB images
+		if(nchannels > 2)	// RGB images
 		{
 			dprintf(0, "rgb_to_gray: 3 channel input");
 			switch (rgb_format)

@@ -1986,15 +1986,14 @@ int main(int nargs, char** args){
 		}
 
 		f_rgb_format = MATRIX_RGB_TYPE_CHUNK;
+		valid_channels = f_valid_channels;
+		nchannels = f_nchannels;
 
 		// Ungamma input to have linear input
 		if(gammacor_in)
 		{
 			Matrix::ungamma<type>(host_input_f, host_input_f, H * W * f_valid_channels);
 		}
-
-		valid_channels = f_valid_channels;
-		nchannels = f_nchannels;
 
 		if(load_it)
 		{
@@ -2188,11 +2187,11 @@ int main(int nargs, char** args){
 	if (conf == CONF_TO_GRAY)
 	{
 		type *host_f_gray = new type[H * W];
-		/*Matrix::RGB_to_Gray(host_input_f, host_f_gray, H * W, f_valid_channels, f_rgb_format);*/
-		for(int i = 0; i < H*W; i++)
+		Matrix::RGB_to_Gray(host_input_f, host_f_gray, H * W, f_valid_channels, f_rgb_format);
+		/*for(int i = 0; i < H*W; i++)
 		{
 			host_f_gray[i] = 0.2989*host_input_f[3 * i ] + 0.587* host_input_f[3 * i + 1] + 0.114*host_input_f[3*i + 2];
-		}
+		}*/
 		// save to png
 		
 		unsigned char * pixels = new unsigned char[H * W ];
@@ -2829,41 +2828,29 @@ int main(int nargs, char** args){
 				if(print_gamma)
 				{
 					dprintf(0, "\nPrinting iteration %d with GAMMA	correction ...", it);
-					std::string final_output_file_name = out_name + get_im_format(output_format);
-					//unsigned char* p = pixels;
-					unsigned char * pixels = new unsigned char[H * W * nchannels];
-					
-					unsigned char *p = pixels;
-					for(int i = 0; i< H*W; i++)
+					dprintf(0, "\nnchannels = %d, valid_channels = %d", nchannels, valid_channels);
+					std::string final_output_file_name = out_name + get_im_format(output_format);		
+
+					unsigned char * pixels = new unsigned char[H * W * valid_channels];
+					for(int i = 0; i < H * W ; i++)
 					{
-						//Change first color channels
-						for(int ch = 0; ch < valid_channels; ch ++){
-							type val = ((type)(host_temp[ch * H * W + i]));
-							
-							if(scale_back)
-								val = val / scale;
-							
-							val = Matrix::apply_gamma<type>(val);
-
-							*p = (unsigned char)(val * 255);
-							p++;
+						for(int c = 0; c < valid_channels; c++)
+						{
+							pixels[valid_channels * i + c] = (unsigned char) (Matrix::apply_gamma<type>(host_temp[H * W * c + i]) * 255);
 						}
-						//Skip possible alpha channel (last channel)
-						for(int ch = valid_channels; ch < nchannels; ch ++){
-							*p = 0;
-							p++;
-						}
+						
 					}
-					if(debug) dprintf(0, "done.");
+					dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
+					write_png(final_output_file_name , pixels, H, W, valid_channels , 8, debug);
+					dprintf(0, "\n\t > %s saved.\n", final_output_file_name.data());
 
-					// Save PNG image
-					write_png(final_output_file_name, pixels, H, W, nchannels, 8, debug);
-					dprintf(0, "\n\t > %s", final_output_file_name.data());
 					if(save_log)
 					{
 						fprintf(log_file, "\n\t > %s", final_output_file_name.data());
 					}
+
 					delete[] pixels;
+
 				}
 
 				// If we want to print linear space and default ouput was not in linear space
@@ -2871,36 +2858,25 @@ int main(int nargs, char** args){
 				{
 					dprintf(0, "\nPrinting iteration %d in LINEAR space ...", it);
 					std::string final_output_file_name = out_name + "-linear.png";
-					unsigned char *pixels = new unsigned char[H * W * nchannels];
-					unsigned char* p = pixels;
-					for(int i = 0; i< H*W; i++)
-					{
-						//Change first color channels
-						for(int ch = 0; ch < valid_channels; ch ++){
-							type val = ((type)(host_temp[ch * H * W + i]));
-							
-							if(scale_back)
-								val = val / scale;
-							*p = (unsigned char)(val * RGB_REF);
-							p++;
-						}
-						//Skip possible alpha channel (last channel)
-						for(int ch = valid_channels; ch < nchannels; ch ++){
-							*p = 0;
-							p++;
-						}
-					}
 
-					// Save PNG image
-					dprintf(0, "\nOUTPUT PNG in LINEAR space ...");
-					write_png(final_output_file_name, pixels, H, W, nchannels, 8, debug);
-					dprintf(0, " \n\t > %s", final_output_file_name.data());
-					
+					unsigned char * pixels = new unsigned char[H * W * valid_channels];
+					for(int i = 0; i < H * W ; i++)
+					{
+						for(int c = 0; c < valid_channels; c++)
+						{
+							pixels[valid_channels * i + c] = (unsigned char) (host_temp[H * W * c + i] * 255);
+						}	
+					}
+					dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
+					write_png(final_output_file_name , pixels, H, W, valid_channels , 8, debug);
+					dprintf(0, "\n\t > %s saved.\n", final_output_file_name.data());
+
 					if(save_log)
 					{
 						fprintf(log_file, "\n\t > %s", final_output_file_name.data());
 					}
 					delete[] pixels;
+
 				}
 
 				// HDR TONE MAPPING: make back RGB and print it
