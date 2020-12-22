@@ -63,7 +63,7 @@ template<typename type> __global__ void trilateral_kernel_rgb(type* f, type* g, 
 					type dist2 = (type)(di * di + dj * dj);
 					switch (stype){
 					case 0:	// gaussian
-						temp *= exp(-0.5f * dist2 /ss/ss);
+						temp *= exp(-0.5f * dist2 /ss / ss);
 						break;
 					case 1:	// tukey
 						temp *= max(0.0f, 1.0f-dist2 / ss /ss) * max(0.0f, 1.0f-dist2 / ss /ss);

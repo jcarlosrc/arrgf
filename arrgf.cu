@@ -132,6 +132,33 @@ std::string get_lm_name(int lm)
 	}
 }
 
+float get_lm_normalizer(int lm)
+{
+	switch(lm)
+	{
+		case LM_NONE:
+		return 1.0;
+		break;
+
+		case LM_MAX:
+		return 0.48;
+		break;
+
+		case LM_MEAN:
+		return 0.33;
+		break;
+
+		case LM_STDEV:
+		return 0.35;
+		break;
+
+		default:
+		return 1.0;
+		break;
+
+	}
+}
+
 #define W_BOX 0
 #define W_CIRCLE 1
 #define W_GAUSSIAN 2
@@ -174,35 +201,55 @@ std::string get_conf_name(int conf)
 			return "none";
 			break;
 		case CONF_ARRGF:
-			return "ARRGF";
+			return "arrgf";
 			break;
 		case CONF_RRGF:
-			return "RRGF";
+			return "rrgf";
 			break;
 		case CONF_RGF:
-			return "RGF";
+			return "rgf";
 			break;
 		case CONF_BIL:
-			return "Bilateral";
+			return "bilateral";
 			break;
 		case CONF_CONV:
-			return "Convolution";
+			return "convolution";
 			break;
 		case CONF_GAMMIFY:
-			return "GAMMA";
+			return "gamma";
 			break;
 		case CONF_UNGAMMIFY:
-			return "LINEAR";
+			return "linear";
 			break;
 		case CONF_TONE_MAPPING:
-			return "TM";
+			return "tm";
 			break;
 		case CONF_TO_GRAY:
-			return "GRAY";
+			return "gray";
 			break;
 		default:
 			return "none";
 	}
+}
+
+#define IMAGE_EXT_MIRROR 1;
+#define IMAGE_EXT_ZEROS 0;
+
+std::string get_domain_ext_name(int extension)
+{
+	switch(extension)
+	{
+		case 0:
+			return "zeros";
+			break;
+		case 1:
+			return "mirror";
+			break;
+		default:
+			return "";
+			break;
+	}
+	return "";
 }
 
 //Block dimensions for Bil
@@ -227,7 +274,7 @@ bool print_alpha_channel = false;
 bool print_input_png = false;
 
 int H, W;	// Input widht and height
-int domain_extension = 0;
+int domain_extension = IMAGE_EXT_MIRROR;
 bool domain_extension_exp = false;
 
 int debug = 0;
@@ -273,7 +320,9 @@ int ss_exp = 0;
 int ss_mod = 1;
 type ss;
 
-type gaussian_neigh = 4.0;
+// Gaussian support size in terms of \sigma
+type gaussian_support = 4.0;
+bool gaussian_support_exp = false;
 
 int sker_mod = 1;	// allow modifications?
 int sker_exp = 0;	// is explicitly defined?
@@ -618,7 +667,7 @@ int set_conf ()
 void make_output_name(std::string *out_name)
 {
 	// Add adapt_sr info to RGF
-	if(adapt_sr && adaptive == false)
+	if(adapt_sr && (conf == CONF_RGF || conf == CONF_RRGF))
 	{
 		*out_name += "_asr";
 	}
@@ -629,7 +678,7 @@ void make_output_name(std::string *out_name)
 	}
 	if(sr > 0 )
 	{
-		*out_name += "-sr-" +  Patch::to_string_f(sr, 2);
+		*out_name += "-sr-" +  Patch::to_string_f(sr, 4);
 	}
 	if(sker_exp)
 	{
@@ -643,9 +692,10 @@ void make_output_name(std::string *out_name)
 	{
 		*out_name += "xic_1_" + Patch::to_string_f(ss / calibration_xicxss,2);
 	}
-	if(sreg_exp) *out_name += "-sreg_" + Patch::to_string_f(sreg, 2);
+	// Add regularization info
+	if(sreg_exp && regker > -1 ) *out_name += "-sreg_" + Patch::to_string_f(sreg, 2);
 	// Add Adaptive Filter info
-	if (adaptive && ss > 0 && local_measure_exp)
+	if (adaptive && ss > 0 )
 	{
 		*out_name += "-lm_" + get_lm_name(local_measure);
 		*out_name += "_" + get_w_name(lweights) + "_" + Patch::to_string_f(sl, 2);
@@ -673,7 +723,13 @@ void make_output_name(std::string *out_name)
 	// Add infsr info
 	if(infsr_exp == true)
 	{
-		*out_name += "-infsr_" + Patch::to_string_f(infsr, 2);
+		*out_name += "-infsr_" + Patch::to_string_f(infsr, 4);
+	}
+
+	// Add gaussian neighboorhood size info
+	if(gaussian_support_exp == true)
+	{
+		*out_name += "-gsupport_" + Patch::to_string_f(gaussian_support, 2);
 	}
 
 }
@@ -689,6 +745,8 @@ int main(int nargs, char** args){
 	all_norms.push_back("l2");
 	all_norms.push_back("l2loc");
 	all_norms.push_back("max");
+
+	dprintf(0, "\nAll Norms total: %lu", all_norms.size());
 	
 	// Initialize valid algorithms
 	conf_all.push_back("arrgf");
@@ -716,12 +774,13 @@ int main(int nargs, char** args){
 		argi ++;
 
 		/* GENERAL CONFIGURATIONS */
-		if(pname == "-gauss-neigh" || pname == "-gn" || pname == "-gauss")
+		if(pname == "-gauss-support" || pname == "-gsupport" || pname == "-gaussian-support")
 		{
-			gaussian_neigh = atof(args[argi]);
+			gaussian_support = atof(args[argi]);
+			gaussian_support_exp = true;
 			argi ++;
 		}
-		if(pname == "-ext-zeros" || pname == "-zeros")
+		if(pname == "-ext-zeros" || pname == "-zeros" || pname == "-ext-zero")
 		{
 			domain_extension = 0;
 			domain_extension_exp = true;
@@ -770,7 +829,7 @@ int main(int nargs, char** args){
 			print_input_txt = true;
 		}
 
-		if (pname.compare("-log") == 0 || pname.compare(">") == 0)
+		if (pname == "-log" || pname == ">")
 		{
 			auto_log_string = false;
 			save_log = true;
@@ -780,14 +839,14 @@ int main(int nargs, char** args){
 				argi ++;
 			}
 			
-			if (log_file_name.compare("auto") == 0)
+			if (log_file_name == "auto")
 			{
 				auto_log_string = true;
 				log_file_name = "";
 			}
 		}
 		
-		if (pname.compare("-log-auto") == 0 || pname.compare("-make-log") == 0)
+		if (pname == "-log-auto" || pname == "-make-log")
 		{
 			save_log = true;
 			log_file_name = std::string("");
@@ -840,7 +899,7 @@ int main(int nargs, char** args){
 			print_linear = false;
 		}
 
-		if(pname.compare("-txt") == 0 || pname.compare("-save-txt") == 0 || pname == "-print-txt")
+		if(pname == "-txt" || pname == "-save-txt" || pname == "-print-txt")
 		{
 			save_txt = true;
 		}
@@ -866,12 +925,12 @@ int main(int nargs, char** args){
 			print_linear = true;
 			gammacor_load_it = false;
 		}*/
-		if(pname.compare("-in-linear") == 0 || pname.compare("-linear-in") == 0 || pname.compare("-linear-input") == 0 || pname.compare("-input-linear") == 0 || pname == "-lin-in" || pname == "-in-lin")
+		if(pname == "-in-linear"|| pname == "-linear-in" || pname == "-linear-input"|| pname == "-input-linear" || pname == "-lin-in" || pname == "-in-lin")
 		{
 			gammacor_in = false;
 		}
 
-		if(pname.compare("-out-linear-also") == 0 || pname.compare("-linear-also") == 0 || pname == "-linear-output-also" || pname == "-output-linear-also")
+		if(pname == "-out-linear-also" || pname == "-linear-also"|| pname == "-linear-output-also" || pname == "-output-linear-also")
 		{
 			print_linear = true;
 		}
@@ -879,24 +938,24 @@ int main(int nargs, char** args){
 		{
 			print_linear = true;
 		}
-		if(pname.compare("-out-linear-only") == 0 || pname.compare("-linear-only") == 0 || pname.compare("-out-linear") == 0 || pname.compare("-output-linear") == 0 || pname == "-linear-output" || pname == "-linear-out" || pname == "-linear-output-only" || pname == "-output-linear-only")
+		if(pname == "-out-linear-only" || pname == "-linear-only" || pname == "-out-linear" || pname == "-output-linear" || pname == "-linear-output" || pname == "-linear-out" || pname == "-linear-output-only" || pname == "-output-linear-only")
 		{
 			print_linear = true;
 			print_gamma = false;
 		}
-		if(pname.compare("-load-it-linear") == 0)
+		if(pname == "-load-it-linear")
 		{
 			gammacor_load_it = false;
 		}
-		if(pname.compare("-load-it-gamma") == 0)
+		if(pname == "-load-it-gamma")
 		{
 			gammacor_load_it = true;
 		}
-		if(pname.compare("-in-gamma") == 0 || pname.compare("-gamma-in") == 0 || pname == "-input-gamma" || pname == "-gamma-input")
+		if(pname == "-in-gamma" || pname == "-gamma-in" || pname == "-input-gamma" || pname == "-gamma-input")
 		{
 			gammacor_in = true;
 		}
-		if(pname.compare("-out-gamma") == 0 || pname.compare("-gamma-out") == 0 || pname.compare("-output-gamma") == 0 || pname.compare("-gamma-output") == 0)
+		if(pname == "-out-gamma" || pname == "-gamma-out" || pname == "-output-gamma" || pname == "-gamma-output")
 		{
 			print_gamma = true;
 			print_linear = false;
@@ -925,7 +984,7 @@ int main(int nargs, char** args){
 			print_diff_single_linear = true;
 		}
 		
-		if(pname == "-txt-local-measure" || pname == "-txt-lm")
+		if(pname == "-txt-local-measure" || pname == "-txt-lm" || pname == "-print-lm-txt" || pname == "-print-local-measure-txt")
 		{
 			txt_local_measure = true;
 		}
@@ -962,7 +1021,7 @@ int main(int nargs, char** args){
 
 		/* ALGORITHMS */
 
-		if(pname.compare("-arrgf") == 0)
+		if(pname == "-arrgf")
 		{
 			if(conf_mod)
 			{
@@ -970,7 +1029,7 @@ int main(int nargs, char** args){
 				set_conf();
 			}
 		}
-		if(pname.compare("-rrgf") == 0)
+		if(pname == "-rrgf")
 		{
 			if(conf_mod)
 			{
@@ -978,7 +1037,7 @@ int main(int nargs, char** args){
 				set_conf();
 			}
 		}
-		if(pname.compare("-rgf") == 0)
+		if(pname == "-rgf")
 		{
 			if(conf_mod)
 			{
@@ -986,7 +1045,7 @@ int main(int nargs, char** args){
 				set_conf();
 			}
 		}
-		if(pname.compare("-conv") == 0 || pname.compare("-convolution") == 0)
+		if(pname == "-conv" || pname == "-convolution")
 		{
 			if(conf_mod)
 			{
@@ -994,7 +1053,7 @@ int main(int nargs, char** args){
 				set_conf();
 			}
 		}
-		if(pname.compare("-bilateral") == 0|| pname.compare("-bil") == 0)
+		if(pname == "-bilateral"|| pname == "-bil")
 		{
 			if(conf_mod)
 			{
@@ -1024,15 +1083,17 @@ int main(int nargs, char** args){
 
 		/* CONVERGENCE */
 		// Stack for showing norm values between iterations. 
-		if(pname.compare("-show-norm") == 0 || pname.compare("-show-norms") == 0 || pname.compare("-show-conv-print-norm") == 0 || pname.compare("-show-conv-print-norms") == 0 || pname.compare("-show-conv-print") == 0|| pname.compare("-show-conv-norms") == 0 || pname.compare("-show-conv") == 0 || pname.compare("-show-conv-norm") == 0)
+		if(pname == "-show-norm" || pname == "-show-norms" || pname == "-show-conv-print-norm" || pname == "-show-conv-print-norms" || pname == "-show-conv-print"|| pname == "-show-conv-norms" || pname == "-show-conv" || pname == "-show-conv-norm")
 		{
 			
+			dprintf(0, "\n\nReading SHOW NORM list");
+
 			show_norm_exp = true;
-			if(pname.compare("-show-conv-norms") == 0 || pname.compare("-show-conv") == 0 || pname.compare("-show-conv-norm") == 0)
+			if(pname == "-show-conv-norms" || pname == "-show-conv" || pname == "-show-conv-norm")
 			{
 				show_conv = true;
 			}
-			if(pname.compare("-show-conv-print") == 0 || pname.compare("-show-conv-print-norms") || pname.compare("-show-conv-print-norm") == 0)
+			if(pname == "-show-conv-print"|| pname == "-show-conv-print-norms" || pname == "-show-conv-print-norm")
 			{
 				show_conv = true;
 				print_alt_conv = true;
@@ -1056,16 +1117,16 @@ int main(int nargs, char** args){
 		}
 
 		// add ALL norms for showing
-		if (pname.compare("-show-norm-all") == 0 || pname.compare("-show-all-norms") == 0 || pname.compare("-show-conv-print-all") == 0 || pname.compare("-show-conv-all") == 0)
+		if (pname == "-show-norm-all" || pname == "-show-all-norms" || pname == "-show-conv-print-all" || pname == "-show-conv-all")
 		{			
 			calc_norms = true;
 			check_and_add(&show_norm_list, all_norms);
 			
-			if(pname.compare("-show-conv-all") == 0)
+			if(pname == "-show-conv-all")
 			{
 				show_conv = true;
 			}
-			if(pname.compare("-show-conv-print-all") == 0)
+			if(pname == "-show-conv-print-all")
 			{
 				show_conv = true;
 				print_alt_conv = true;
@@ -1075,21 +1136,22 @@ int main(int nargs, char** args){
 
 		}
 		
-		if(pname.compare("-show-conv") == 0)
+		if(pname == "-show-conv")
 		{
 			show_conv = true;
 		}
 		
-		if(pname.compare("-show-conv-print") == 0)
+		if(pname == "-show-conv-print")
 		{
 			show_conv = true;
 			print_alt_conv = true;
 		}
 
 		
-		if(pname.compare("-conv-norm") == 0 || pname.compare("-conv-norms") == 0 || pname.compare("-convergence-norms") == 0 || pname.compare("-convergence-norm") == 0)
+		if(pname == "-conv-norm" || pname == "-conv-norms" || pname == "-convergence-norms" || pname == "-convergence-norm")
 		{
-			
+			dprintf(0, "\n\nReading CONVERGENCE NORM list");
+
 			conv_norm_exp = true;
 			calc_norms = true;
 			
@@ -1104,37 +1166,41 @@ int main(int nargs, char** args){
 			else
 			{
 				argi --;
-				argi = Util::read_and_validate_input_list(&conv_norm_list, &all_norms, args, argi, nargs, false);
+				argi = Util::read_and_validate_input_list(&conv_norm_list, &all_norms, args, argi, nargs, true);
 			}
+
 		}
 		
 		// Check for list of eps for convergence
-		if(pname.compare("-conv-eps") == 0)
+		if(pname == "-conv-eps")
 		{
+			dprintf(0, "\n\nReading EPS CONVERGENCE list");
+
 			conv_eps_list.clear();
 			argi = Util::read_input_list(&conv_eps_list, args, argi, nargs);
+
 			conv_eps_exp = true;
 			calc_norms = true;
 		}
 
 
-		if( pname.compare("-no-stop-showing-on-convergence") == 0 || pname.compare("-no-stop-showing-on-conv") == 0)
+		if( pname == "-no-stop-showing-on-convergence" || pname == "-no-stop-showing-on-conv")
 		{
 			stop_showing_on_convergence = false;
 		}
-		if( pname.compare("-stop-showing-on-convergence") == 0 || pname.compare("-stop-showing-on-conv") == 0)
+		if( pname == "-stop-showing-on-convergence" || pname == "-stop-showing-on-conv")
 		{
 			stop_showing_on_convergence = true;
 		}
 		
-		if( pname.compare("-stop-on-conv") == 0 || pname.compare("-stop-on-convergence") == 0 || pname.compare("-stop-conv") == 0 || pname.compare("-force-stop-on-convergence") == 0 || pname.compare("-fs") == 0 || pname.compare("-force-stop") == 0 || pname.compare("-force-stop-on-conv") == 0)
+		if( pname == "-stop-on-conv" || pname == "-stop-on-convergence" || pname == "-force-stop-on-convergence" || pname == "-force-stop" || pname == "-force-stop-on-conv")
 		{
 			calc_norms = true;
 			force_stop_on_convergence = true;
 		}
 
 		// add ALL norms to the convergence criteria
-		if (pname.compare("-conv-norm-all") == 0 || pname.compare("-conv-all-norms") == 0)
+		if (pname == "-conv-norm-all" || pname == "-conv-all-norms")
 		{			
 			
 			conv_norm_exp = true;
@@ -1145,7 +1211,7 @@ int main(int nargs, char** args){
 
 		/* ITERATIONS */	
 		
-		if(pname.compare("-max-it") == 0)
+		if(pname == "-max-it")
 		{
 			max_it = atoi(args[argi]);
 			printf("-max-it");
@@ -1153,18 +1219,18 @@ int main(int nargs, char** args){
 		}
 
 		// Check for iterations to print in the format x1 and x2 and x3 to x4 to x5 and x6 ... 
-		if(pname.compare("-print-it") == 0 || pname.compare("-print-it-linear") == 0 || pname.compare("-print-it-gamma") == 0 || pname == "-nit" || pname == "-it" || pname == "-calc-it" /* Legacy */)
+		if(pname == "-print-it"|| pname == "-print-it-linear" || pname == "-print-it-gamma" || pname == "-nit" || pname == "-it" || pname == "-calc-it" /* Legacy */)
 		{
-			if(pname.compare("-print-it-linear") == 0 || pname.compare("-print-linear") == 0)
+			if(pname == "-print-it-linear" || pname == "-print-linear")
 			{
 				print_linear = true;
 			}
-			if(pname.compare("-print-it-gamma") == 0 || pname.compare("-print-it-gamma") == 0 || pname.compare("-print-it") == 0 )
+			if(pname == "-print-it-gamma" || pname == "-print-it-gamma" || pname == "-print-it" )
 			{
 				print_gamma = true;
 			}
 			std::string option = std::string(args[argi]);
-			if(option.compare("all") == 0)
+			if(option == "all")
 			{
 				print_all = true;
 				argi++;
@@ -1185,19 +1251,19 @@ int main(int nargs, char** args){
 		{
 			print_linear = true;
 		}
-		if(pname.compare("-print-all") == 0 || pname.compare("-print-all-gamma") == 0)
+		if(pname == "-print-all"|| pname == "-print-all-gamma")
 		{
 			print_all = true;
 			print_gamma = true;
 		}
-		if(pname.compare("-print-all-linear") == 0)
+		if(pname == "-print-all-linear")
 		{
 			print_all = true;
 			print_linear = true;
 			
 		}
 
-		if(pname.compare("-load-it") == 0)
+		if(pname == "-load-it")
 		{
 			if(argi + 3 < nargs)
 			{
@@ -1225,8 +1291,10 @@ int main(int nargs, char** args){
 		/* ARRGF PARAMETERS */
 		
 		// Check for list of sr values
-		if(pname.compare("-sr") == 0)
+		if(pname == "-sr")
 		{
+			dprintf(0, "\n\nReading SR list");
+
 			srValues.clear();
 			argi = Util::read_input_list(&srValues, args, argi, nargs);
 			sr_exp = true;
@@ -1237,13 +1305,15 @@ int main(int nargs, char** args){
 		}
 		
 		// Check for list of ss values
-		if(pname.compare("-ss") == 0)
+		if(pname == "-ss")
 		{
+			dprintf(0, "\n\nReading SS list");
+
 			ssValues.clear();
-			argi = Util::read_input_list(&ssValues, args, argi, nargs);			
+			argi = Util::read_input_list(&ssValues, args, argi, nargs);	
 		}
 		// Regularization
-		if(pname.compare(std::string("-sreg")) == 0 || pname.compare("-s") == 0 || pname.compare("-reg-sigma") == 0 || pname.compare("-regularization-sigma") == 0 || pname.compare("-regs") == 0)
+		if(pname == "-sreg" || pname == "-s" || pname == "-reg-sigma" || pname == "-regularization-sigma" || pname == "-regs")
 		{
 			if(sreg_mod )
 			{
@@ -1254,6 +1324,7 @@ int main(int nargs, char** args){
 		}
 		if (pname == "-xic")
 		{
+			dprintf(0, "\n\nReading XIC input list");
 			ssValues.clear();
 			argi = Util::read_input_list(&ssValues, args, argi, nargs);
 			xic2ss<type>(ssValues, calibration_xicxss);
@@ -1271,6 +1342,7 @@ int main(int nargs, char** args){
 
 		if(pname == "-scale")
 		{
+			dprintf(0, "\n\nReading SCALE list");
 			scaleValues.clear();
 			argi = Util::read_input_list(&scaleValues, args, argi, nargs);
 			scale_exp = true;
@@ -1311,19 +1383,19 @@ int main(int nargs, char** args){
 			std::string temp = std::string(args[argi]);
 			argi ++;
 
-			if(temp.compare(std::string("max")) == 0)
+			if(temp == "max")
 			{
 				local_measure = LM_MAX;
 				local_measure_exp = 1;
 				sr_ref = 0.48;
 			}
-			if(temp.compare(std::string("mean")) == 0)
+			if(temp == "mean")
 			{
 				local_measure = LM_MEAN;
 				local_measure_exp = 1;
 				sr_ref = 0.33;
 			}
-			if(temp.compare(std::string("stdev")) == 0)
+			if(temp == "stdev")
 			{
 				local_measure = LM_STDEV;
 				local_measure_exp = 1;
@@ -1370,27 +1442,27 @@ int main(int nargs, char** args){
 			argi ++;
 		}
 		// Regularization for local measure
-		if( lmreg_ker_mod && ( pname.compare("-lmreg-ker") == 0 || pname.compare("-lm-reg") == 0 || pname.compare("-lm-reg-ker") == 0|| pname.compare("-lmregker") == 0 || pname == "-lmreg" ) )
+		if( lmreg_ker_mod && ( pname == "-lmreg-ker" || pname == "-lm-reg" || pname == "-lm-reg-ker"|| pname == "-lmregker" || pname == "-lmreg" ) )
 		{
 			std::string temp = std::string(args[argi]);
 			argi++;
 			
-			if(temp.compare(std::string("none")) == 0 || temp.compare(std::string("off")) == 0 || temp.compare("no") == 0)
+			if(temp == "none"|| temp == "off"|| temp == "no")
 			{
 				lmreg_ker = KER_NONE;
 				lmreg_s = 0;
 				lmreg_ker_exp = 1;
 			}else
-			if(temp.compare(std::string("gaussian")) == 0){
+			if(temp == "gaussian"){
 				lmreg_ker = KER_GAUSSIAN;
 				lmreg_ker_exp = 1;
 				
 			} else
-			if(temp.compare(std::string("tukey")) == 0) {
+			if(temp == "tukey") {
 				lmreg_ker = KER_TUKEY;
 				lmreg_ker_exp = 1;
 			} else
-			if(temp.compare(std::string("box")) == 0) {
+			if(temp == "box") {
 				lmreg_ker = KER_BOX;
 				lmreg_ker_exp = 1;
 			}
@@ -1400,7 +1472,7 @@ int main(int nargs, char** args){
 			}
 		}
 		// sigma value for local measure regularization
-		if(pname.compare("-lm-reg-s") == 0 || pname.compare("-lmreg-s") == 0 || pname.compare("-lmregs") == 0 || pname.compare("-lmreg-sigma") == 0 || pname.compare("-local-measure-reg-sigma") == 0 || pname.compare("-local-measure-reg-s") == 0 || pname == "-ls" || pname == "-sl")
+		if(pname == "-lm-reg-s" || pname == "-lmreg-s" || pname == "-lmregs" || pname == "-lmreg-sigma" || pname == "-local-measure-reg-sigma" || pname == "-local-measure-reg-s" || pname == "-ls" || pname == "-sl")
 		{
 			// If we have not set kernel, gaussian by default
 			if(lmreg_ker_exp == 0)
@@ -1412,7 +1484,7 @@ int main(int nargs, char** args){
 			argi++;
 		}
 
-		if(pname.compare(std::string("-sm")) == 0)
+		if(pname == "-sm")
 		{
 			if(sm_mod)
 				sm = atof(args[argi]);
@@ -1420,43 +1492,43 @@ int main(int nargs, char** args){
 		}
 	
 		// Check for adaptive
-		if(adaptive_mod && (pname.compare("-adaptive") == 0 || pname.compare("-a") == 0))
+		if(adaptive_mod && (pname == "-adaptive" || pname == "-a"))
 		{
 			adaptive = 1;
 			adaptive_exp = 1;
 		}
-		if(pname.compare("-no-adaptive") == 0 || pname.compare("-adaptive-no") == 0)
+		if(pname == "-no-adaptive" || pname == "-adaptive-no")
 		{
 			adaptive = 0;
 			adaptive_exp = 1;
 		}
 		// debug
 
-		if(pname.compare("-d") == 0 || pname.compare("-debug") == 0)
+		if(pname == "-d" || pname == "-debug")
 			debug = 1;
 
 		// Spatial Kernel
-		if(sker_mod && (pname.compare("-sker") == 0 || pname.compare(std::string("-spatial-kernel")) == 0 || pname.compare("-spatial") == 0 || pname.compare("-spatialocal_measure") == 0 || pname.compare("-spatial-ker") == 0) || pname.compare("-ssker") == 0 )
+		if(sker_mod && (pname == "-sker"|| pname == "-spatial-kernel" || pname == "-spatial" || pname == "-spatialocal_measure" || pname == "-spatial-ker" || pname == "-ssker" ))
 		{
 			std::string temp = std::string(args[argi]);
 			argi ++;
 	
-			if(temp.compare(std::string("gaussian")) == 0){
+			if(temp == "gaussian"){
 				
 				sker = KER_GAUSSIAN;
 				sker_exp = 1;
 				
 			} else
-			if(temp.compare(std::string("tukey")) == 0) {	
+			if(temp == "tukey") {	
 				sker_exp = 1;
 				sker = KER_TUKEY;		
 				
 			} else
-			if(temp.compare(std::string("box")) == 0) {	
+			if(temp == "box") {	
 				sker_exp = 1;
 				sker = KER_BOX;
 			} else
-			if(temp.compare(std::string("lorentz")) == 0) {
+			if(temp == "lorentz") {
 				sker_exp = 1;
 				sker = KER_LORENTZ;
 
@@ -1469,7 +1541,7 @@ int main(int nargs, char** args){
 				argi --;
 
 			}
-			else if(temp.compare(std::string("sinc")) == 0)
+			else if(temp == "sinc")
 			{
 				sker_exp = 1;
 				sker = KER_SINC;
@@ -1477,7 +1549,7 @@ int main(int nargs, char** args){
 				argi --;
 				
 			}
-			else if(temp.compare("delta") == 0)
+			else if(temp == "delta")
 			{
 				sker_exp = 1;
 				sker = KER_DELTA;
@@ -1527,7 +1599,7 @@ int main(int nargs, char** args){
 		}
 	
 		// Check for Regularization Kernel
-		if(regker_mod && (pname.compare(std::string("-regker")) == 0 || pname.compare(std::string("-reg-kernel")) == 0 || pname.compare("-reg") == 0 || pname.compare("-regularization-kernel") == 0 ))
+		if(regker_mod && (pname == "-regker" || pname == "-reg-kernel" || pname == "-reg" || pname == "-regularization-kernel" ))
 		{
 			
 			// Regularization kernel
@@ -1560,7 +1632,7 @@ int main(int nargs, char** args){
 			
 		}
 		
-		if(pname.compare(std::string("-mker")) == 0 && mker_mod)
+		if(pname == "-mker" && mker_mod)
 		{
 			std::string temp = std::string(args[argi]);
 			argi ++;
@@ -1602,23 +1674,35 @@ int main(int nargs, char** args){
 	// ************************ 	VALIDATION AND FILLING OF MISSING DATA, INITIALIZATION ALSO ************************************	
 	// ******************************** CONVERGENCE ***********************
 	
+	dprintf(0, "\n\nValidation and filling of missing data:");
+	
 	if(show_conv)
-	calc_norms = true;
+	{
+		dprintf(0, "\n-show-conv option enabled -> calc_norms = true");
+		calc_norms = true;
+	}
+
 	if(conv_eps_list.size() < 1)
 	{
+		dprintf(0, "\nConvergence Epsilon list empty. Filling with a default value");
 		if(show_conv)
 			conv_eps_list.push_back(conv_eps_default);
 	}
 	else
 	{
+		dprintf(0, "\nOrdering Convernce Epsilon values in reverse order");
 		// Order conv_eps in reverse order.
 		std::sort(conv_eps_list.begin(), conv_eps_list.end());
 	}
 	
 	if(conv_norm_list.size() > 0)
 	{
+		dprintf(0, "\n%lu Convergence Norms specified.", conv_norm_list.size());
 		calc_norms = true;
 		calc_convergence = true;
+	}
+	else{
+		dprintf(0, "\nConvernce Norm List is empty");
 	}
 	
 	// force stop on convergence if we have not set a maximum limit
@@ -1626,6 +1710,7 @@ int main(int nargs, char** args){
 	{
 		if(it_list.size() < 1)
 		{
+			dprintf(0, "\nNo iterations to reach. Algorithm will stop on convergence.");
 			force_stop_on_convergence = true;
 		}
 		
@@ -1643,9 +1728,11 @@ int main(int nargs, char** args){
 	}
 	
 	// We have to add the convergence criteria to the showing criteria.
+	dprintf(0, "\nAdding Convergence Norms into Showing Norms");
 	check_and_add(&show_norm_list, conv_norm_list);
 	
 	// We initialize the values of the index of the epsilon for comparisons
+	dprintf(0, "\nInitializing index values for epsilon comparisons.");
 	int n_show_norms = (int) show_norm_list.size();
 	for(int i = 0; i < (int)show_norm_list.size(); i++)
 	{
@@ -1679,7 +1766,7 @@ int main(int nargs, char** args){
 	
 	// ************************** INPUT, OUTPUT *****************************************************************
 	// Inform of parameters
-	if(input_name.compare("") == 0 )
+	if(input_name == "" )
 	{
 		printf("Input file missing.\n");
 		return 0;
@@ -1690,11 +1777,12 @@ int main(int nargs, char** args){
 	}
 	// Automatic log file : input + -log.md
 	if(save_log && auto_log_string){
+		dprintf(0, "\nGenerating automatic log file name");
 		time_t now = time(0);		
 		char* dt = ctime(&now);		
-		if(debug) printf("Time: %s\n", dt);
-		log_file_name = output_name + std::string(" - ") + get_conf_name(conf) + std::string(" - LOG - ") + std::string(dt) + std::string(".md");
-		if(debug) dprintf(0, "Log file output: %s\n", log_file_name.data());
+		dprintf(0, "\n\tTime: %s", dt);
+		log_file_name = output_name + std::string("-") + get_conf_name(conf) + std::string("-LOG-") + std::string(dt) + std::string(".md");
+		dprintf(0, "\n\tLog file output: %s", log_file_name.data());
 	}
 
 	// *** Log file loading 
@@ -1709,21 +1797,33 @@ int main(int nargs, char** args){
 
 	if(save_log)
 	{
-		fprintf(log_file, "Commands: %s", commands_string.data());
+		fprintf(log_file, "LOG file");
+		fprintf(log_file, "\n\nInput Commands: %s", commands_string.data());
 	}
 
 	// ************************************ INFORM PARAMETERS TO USER *************************************************
-
+	if(save_log){
+		printf("\n\nLOG file will be saved to %s\n", log_file_name.data());
+	}
 	printf("\n\nALGORITHM:\t%s\n", get_conf_name(conf).data());
-	if (save_log) fprintf(log_file, "\nALGORITHM CONFIGURATION:\t%s (%i)\n", get_conf_name(conf).data(), conf);
+	if (save_log) fprintf(log_file, "\n\nALGORITHM:\t%s (%i)\n", get_conf_name(conf).data(), conf);
 	
-	printf("\nPARAMETERS:\n");
-	
-	printf("\nInput: \t%s\n", (input_name + get_im_format(input_format)).data());
-	if(gammacor_in)
-		printf("INPUT is GAMMA corrected.\n");
-	else
-		printf("INPUT is already in LINEAR SPACE.\n");
+	printf("\n\nInput: \t%s", (input_name + get_im_format(input_format)).data());
+	if(save_log){
+		fprintf(log_file, "\n\nInput: \t%s", (input_name + get_im_format(input_format)).data());
+	}
+	if(gammacor_in){
+		printf("\n\tINPUT is GAMMA corrected. Will need to ungamma it");
+		if(save_log){
+			fprintf(log_file, "\n\tINPUT is GAMMA corrected. Will need to ungamma it");
+		}
+	}
+	else{
+		printf("\n\tINPUT is already in LINEAR SPACE.");
+		if(save_log){
+			fprintf(log_file, "\n\tINPUT is already in LINEAR SPACE.");
+		}
+	}
 	
 	if(save_log)
 	{
@@ -1731,72 +1831,85 @@ int main(int nargs, char** args){
 	}
 	
 	//printf("Input scaling factor: %.2f\n", scale);
-	printf("Output image prefix: %s\n", output_name.data());
-	if (save_log) fprintf(log_file, "Output image: %s\n", output_name.data());
-	
+	printf("\n\nOutput prefix: %s", output_name.data());
+	if (save_log){
+		fprintf(log_file, "\n\nOutput prefix: %s", output_name.data());
+	}
+	printf("\n\nImage Domain Extension: %s", get_domain_ext_name(domain_extension).data());
+	if(save_log){
+		fprintf(log_file, "\n\nImage Domain Extension: %s", get_domain_ext_name(domain_extension).data());
+	}
+	printf("\n\nGaussian Support Approximation: [-%.2f x sigma, %.2f x sigma]", gaussian_support, gaussian_support);
+	if(save_log){
+		fprintf(log_file, "\n\nGaussian Support Approximation: [-%.2f x sigma, %.2f x sigma]", gaussian_support, gaussian_support);
+	}
 	if(conf == CONF_RGF || conf == CONF_ARRGF || conf == CONF_CONV)
 	{
-		printf("\nSpatial kernel:\t %s", get_ker_name(sker).data());
-		if(save_log) fprintf(log_file, "\nSpatial kernel:\t %s", get_ker_name(sker).data());
+		sr_ref = get_lm_normalizer(local_measure);
+		printf("\n\nSpatial kernel:\t %s", get_ker_name(sker).data());
+		if(save_log) fprintf(log_file, "\n\nSpatial kernel:\t %s", get_ker_name(sker).data());
 		
-		printf("\n\tss values: \t"); printfVector(ssValues); printf("\n");
+		printf("\n\tss values: \t"); printfVector(ssValues);
 		if(save_log)
 		{
 			fprintf(log_file, "\nss values: \t");
 			fprintfVector(log_file, ssValues);
-			fprintf(log_file, "\n");
 		}
 
-		printf("\nRegularization kernel:\t %s\n", get_ker_name(regker).data());
-		if(save_log) fprintf(log_file, "Regularization kernel:\t %s", get_ker_name(regker).data());
+		printf("\n\nRegularization kernel:\t %s", get_ker_name(regker).data());
+		if(save_log) fprintf(log_file, "\n\nRegularization kernel:\t %s", get_ker_name(regker).data());
 
-		printf("\tsreg values: \t"); printfVector(sregValues); printf("\n");
-		if(save_log)
+		if(regker > -1)
 		{
-			fprintf(log_file, "\nsreg values: \t");
-			fprintfVector(log_file, sregValues);
-			fprintf(log_file, "\n");
+			printf("\n\tsreg values: \t"); printfVector(sregValues);
+			if(save_log)
+			{
+				fprintf(log_file, "\nsreg values: \t");
+				fprintfVector(log_file, sregValues);
+			}
 		}
 		
-		printf("\nRange kernel:\t %s", get_ker_name(rker).data());
-		if (save_log) fprintf(log_file, "Range kernel:\t %s", get_ker_name(rker).data());
+		printf("\n\nRange kernel:\t %s", get_ker_name(rker).data());
+		if (save_log) fprintf(log_file, "\n\nRange kernel:\t %s", get_ker_name(rker).data());
 		
-		printf("\n\tsr values: \t"); printfVector(srValues); printf("\n");
+		printf("\n\tsr values: \t"); printfVector(srValues);
 		if(save_log)
 		{
 			fprintf(log_file, "\nsr values: \t");
 			fprintfVector(log_file, srValues);
-			fprintf(log_file, "\n");
 		}
 		
-		printf("\nInput Scaling values: \t"); printfVector(scaleValues); printf("\n");
+		printf("\n\nInput Scaling values: \t"); printfVector(scaleValues);
 		if(save_log )
 		{
-			fprintf(log_file, "Input scaling values: \t");\
+			fprintf(log_file, "\n\nInput scaling values: \t");
 			fprintfVector(log_file, scaleValues);
-			fprintf(log_file, "\n");
 		}
 		
-		printf("Scale back output: %s\n", scale_back_name.data());
-		if(save_log) fprintf(log_file, "Scale back output: %s\n", scale_back_name.data());
-		
+		printf("\n\nScale back output: %s", scale_back_name.data());
+		if(save_log){
+			fprintf(log_file, "\n\nScale back output: %s", scale_back_name.data());
+		} 
 
-		
-		printf("\nAdaptive algorithm:\t %s (%i)\n", adaptive_name.data(), adaptive);
-		if(save_log) fprintf(log_file, "Adaptive algorithm:\t %s (%i)\n", adaptive_name.data(), adaptive);
-		printf("\tInfsr:\t%.4f\n", infsr);
+		printf("\n\nAdaptive algorithm:\t %s (%i)", adaptive_name.data(), adaptive);
+		printf("\n\tInfsr:\t%.4f", infsr);
+		if(save_log){
+			fprintf(log_file, "\nAdaptive algorithm:\t %s (%i)", adaptive_name.data(), adaptive);
+			fprintf(log_file, "\n\tInfsr:\t%.4f", infsr);
+		}
 		
 		if(adaptive)
 		{
-			printf("\tLocal Measure:\t %s", get_lm_name(local_measure).data());
-			if (save_log) fprintf(log_file, "\tLocal measure calculation kernel for adaptiveness:\t %s\n", get_lm_name(local_measure).data());
+			printf("\n\tLocal Measure:\t %s", get_lm_name(local_measure).data());
+			printf("\n\tLocal measure Normalizer factor: %.2f", sr_ref);
+			if (save_log) fprintf(log_file, "\n\tLocal measure calculation kernel for adaptiveness:\t %s", get_lm_name(local_measure).data());
 			if(!sl_exp)
-				printf("\n\tLocal measure weights:\t%s, sl = auto\n", get_w_name(lweights).data());
+				printf("\n\tLocal measure weights:\t%s, sl = auto", get_w_name(lweights).data());
 			else
 				printf("\n\tLocal measure weights: \t%s, sl = %f", get_w_name(lweights).data(), sl);
-			if (save_log) fprintf(log_file, "\tLocal measure weights:\t%s, sl = %.4f\n", get_w_name(lweights).data(), sl);
-			printf("\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
-			if (save_log) fprintf(log_file, "\tLocal measure regularization: \t%s, lmreg-s = %.4f\n", get_ker_name(lmreg_ker).data(), lmreg_s);
+			if (save_log) fprintf(log_file, "\n\tLocal measure weights:\t%s, sl = %.4f", get_w_name(lweights).data(), sl);
+			printf("\n\tLocal measure regularization: \t%s, lmreg-s = %.4f", get_ker_name(lmreg_ker).data(), lmreg_s);
+			if (save_log) fprintf(log_file, "\n\tLocal measure regularization: \t%s, lmreg-s = %.4f", get_ker_name(lmreg_ker).data(), lmreg_s);
 		}
 		//printf("Median kernel:\t %s, ms = %.4f\n", mker_name.data(), sm);	
 		// if we are not spedified iterations to print, just last one
@@ -1804,93 +1917,101 @@ int main(int nargs, char** args){
 		{
 			it_list.push_back(nit);
 		}
-		printf("\nITERATIONS to print:\t"); printfVector(it_list); printf("\n");
+
+		printf("\n\nITERATIONS to print:\t");
+		printfVector(it_list);
 		if(save_log)
 		{
-			fprintf(log_file, "Iterations to print:\t");
+			fprintf(log_file, "\n\nIterations to print:\t");
 			fprintfVector(log_file, it_list);
-			fprintf(log_file, "\n");
 		}
+
 		if(save_txt)
 		{
-			printf("Txt versions will also be saved in linear space in [0,1] range.\n");
+			printf("\nTxt versions will also be saved in linear space range.");
 			if(save_log)
-				fprintf(log_file, "Txt versions will also be saved in linear space in [0,1] range.\n");
+				fprintf(log_file, "\nTxt versions will also be saved in linear space in range.");
 		}
 		
-		if(gammacor_in == false) printf("Input will be read in linear space. (No gamma correction)\n");
-		else printf("Input will be gamma corrected.\n");
-		if(print_linear) printf("Output will be written in linear space (No gamma correction)\n");
-		if(print_gamma) printf("Output will be gamma corrected.\n");
+		if(gammacor_in == false) printf("\n\nInput will be read in linear space. (No gamma correction)");
+		else printf("\n\nInput will be gamma corrected.");
+		if(print_linear) printf("\nOutput will be written in linear space (No gamma correction)");
+		if(print_gamma) printf("\n\nOutput will be gamma corrected.");
 		if(save_log)
 		{
-			if(gammacor_in == false) fprintf(log_file, "Input will be read in linear space. (No gamma correction)\n");
-			if(print_gamma == false) fprintf(log_file, "Output will be written in linear space (No gamma correction)\n");
+			if(gammacor_in == false) fprintf(log_file, "\n\nInput will be read in linear space. (No gamma correction)");
+			if(print_gamma == false) fprintf(log_file, "\nOutput will be written in linear space (No gamma correction)");
 		}
 		
 		if(load_it)
 		{
-			printf("Loading iteration %i from %s\n", it_from, it_from_image_name.data());
-			if(save_log) fprintf(log_file, "Loading iteration %i from %s\n", it_from, it_from_image_name.data());
+			printf("\n\nLoading iteration %i from %s", it_from, it_from_image_name.data());
+			if(save_log) fprintf(log_file, "\n\nLoading iteration %i from %s", it_from, it_from_image_name.data());
 		}
 		if(calc_norms)
 		{
-			printf("\nConvergence criteria:\t");
+			printf("\n\nConvergence criteria:\t");
 			printfVector(conv_norm_list);
-			printf("\n");
 			
 			if (save_log)
 			{
-				fprintf(log_file, "\nConvergence criteria:\t" );
+				fprintf(log_file, "\n\nConvergence criteria:\t" );
 				fprintfVector(log_file, conv_norm_list);
-				fprintf(log_file, "\n");
 			}
 			
-			printf("Convergence for eps :"); printfVector(conv_eps_list); printf("\n");
+			printf("\nConvergence for eps :");
+			printfVector(conv_eps_list);
 			if(save_log)
 			{
-				fprintf(log_file, "Convergence norm epsilon : "); fprintfVector(log_file, conv_eps_list); fprintf(log_file, "\n"); 
+				fprintf(log_file, "\nConvergence norm epsilon : "); fprintfVector(log_file, conv_eps_list);; 
 			}
 			if (force_stop_on_convergence)
-			printf("* Algorithm will STOP if convergence is reached.\n");
-			if(save_log) fprintf(log_file, "* Algorithm will STOP if convergence is reached because of -force-stop.\n");
+			printf("\n* Algorithm will STOP if convergence is reached.");
+			if(save_log) fprintf(log_file, "\n* Algorithm will STOP if convergence is reached because of -force-stop.");
 			
-			printf("* Printing convergence iterations by default.\n");
-			if(save_log) fprintf(log_file, "* Printing convergence iterations by default.\n");
+			printf("\n* Printing convergence iterations by default.");
+			if(save_log) fprintf(log_file, "\n* Printing convergence iterations by default.");
 			
-			printf("\nShowing info for norms : ");
+			printf("\n\nShowing differences between iterations for norms : ");
 			printfVector(show_norm_list);
-			printf("\n");
 			
-			if(show_conv) printf("Showing convergence for  eps = "); printfVector(conv_eps_list);
-			if (print_alt_conv) printf("Printing Convergence Iterations for these norms.\n");
+			if(show_conv){
+				printf("\nShowing differences between iterations for  eps = ");
+				printfVector(conv_eps_list);
+			} 
+			if (print_alt_conv){
+				printf("\nPrinting Convergence Iterations for these norms.");
+			}
 			
 			if(save_log)
 			{
 				fprintf(log_file, "\nShowing info for norms : ");
 				fprintfVector(log_file, show_norm_list);
-				fprintf(log_file, "\n");
 				
-				if(show_conv) fprintf(log_file, "Showing convergence for  eps = "); fprintfVector(log_file, conv_eps_list);
-				if (print_alt_conv) fprintf(log_file, "Printing Convergence Iterations for these norms.\n");		
+				if(show_conv){
+					fprintf(log_file, "\nShowing convergence for  eps = ");
+					fprintfVector(log_file, conv_eps_list);
+				} 
+				if (print_alt_conv){
+					fprintf(log_file, "\nPrinting Convergence Iterations for these norms.");	
+				}	
 			}
-			
 		}
 		else
 		{
-			printf("\nConvergence metric:\tnone\n");
-			if(save_log) fprintf(log_file, "Convergence metric:\tnone\n");
+			printf("\n\nConvergence metric:\tnone");
+			if(save_log){
+				fprintf(log_file, "\nConvergence metric:\tnone");
+			} 
 		}
 
-		if(save_log)
-			printf("\nlog file will be saved to %s\n", log_file_name.data());
 	
 	}
 	
 	// ---------------- INPUT LOADING ---------------------------------------------------------------------------
 	// ----------------------------------------------------------------------------------------------------------
 		
-	if(debug) printf("\n LOADING INPUT AND INITIALIZATION OF CPU / GPU ARRAYS .. \n");
+	if(debug) printf("\n LOADING INPUT AND INITIALIZATION OF CPU / GPU ARRAYS .. ");
 	
 	int f_nchannels, f_valid_channels;
 	int gH, gW, gnchannels, gvalid_channels;
@@ -1903,7 +2024,7 @@ int main(int nargs, char** args){
 	// Info for input of RGF algorithm. Can be gray version of f
 	int nchannels, valid_channels;
 	
-	dprintf(0,"Reading input image f ... ");
+	dprintf(0,"\nReading input image f ... ");
 	//read_png(args[1], H, W, nchannels, pixels, bit_depth, valid_channels);
 
 	// Array to store input data
@@ -1917,15 +2038,18 @@ int main(int nargs, char** args){
 	// HDR image reading. Output = RGB RGB RGB
 	if(input_format == IMAGE_HDR)
 	{
-		dprintf(0, "\nReading IMAGE_HDR\n");
+		dprintf(0, "\nLoading HDR Input file: %s", (input_name + get_im_format(input_format)).data());
 
 		HDRLoaderResult <type> *hdrData = new HDRLoaderResult<type>();
 		HDRLoader *hdrLoader = new HDRLoader();
 
-		const char* input = (input_name + get_im_format(input_format)).data();
-		
-		if( ! hdrLoader->load<type>(input , *hdrData ) ) {
-			printf( "error loading %s \n", input );
+		//const char* input_file_name = (const char*)(input_name + get_im_format(input_format)).data();
+		std::string input_file_name = input_name + ".hdr";
+
+		dprintf(0, "\nReading IMAGE_HDR %s \n", input_file_name.data());
+
+		if( ! hdrLoader->load<type>(input_file_name.data() , *hdrData ) ) {
+			printf( "\nerror loading %s\n\n", input_file_name.data() );
 			return 1;
 		}
 		// Assign H and W values and get data in format grayscale L_R L_R .. L_G L_G ...
@@ -1944,18 +2068,18 @@ int main(int nargs, char** args){
 		std::swap(host_input_f, temp);
 		delete[] temp;
 
-		dprintf(0, "RGB format changed.\n");
+		dprintf(0, "\nRGB format changed.");
 		
 		gammacor_in = false;
 		load_it = false;
 
-		dprintf(0, "Reading input HDR done.\n");
+		dprintf(0, "\nReading input HDR done.");
 	
 	}
 	// Reading typical GRAY or RGB 8b images
 	else if(input_format == IMAGE_PNG)
 	{
-		dprintf(0, "\nReading IMAGE_PNG image\n");
+		dprintf(0, "\nReading IMAGE_PNG image");
 		read_png((input_name + get_im_format(input_format)).data(),  pixels, H, W, f_nchannels, f_bit_depth, debug);
 		
 		f_valid_channels = f_nchannels;
@@ -1963,10 +2087,10 @@ int main(int nargs, char** args){
 		
 		if(f_bit_depth != 8)
 		{
-			dprintf(0, "Reading Input: bit depth of %i is not supported yet. Aborting ... \n", f_bit_depth);
+			dprintf(0, "\nReading Input: bit depth of %i is not supported yet. Aborting ... ", f_bit_depth);
 			return 0;
 		}
-		printf("Image width: %i, Image height: %i, Number of channels: %i, valid channels: %i\n",H, W, f_nchannels, f_valid_channels);
+		printf("\nImage width: %i, Image height: %i, Number of channels: %i, valid channels: %i",H, W, f_nchannels, f_valid_channels);
 
 		// Initialize host_f
 		host_input_f = new type[f_valid_channels * H * W];
@@ -2000,13 +2124,13 @@ int main(int nargs, char** args){
 			read_png(it_from_image_name + ".png", gpixels, gH, gW, gnchannels,  gbit_depth, debug);
 			if(gbit_depth != 8)
 			{
-				dprintf(0, "Reading Input Iteration: bit depth of %i is not supported yet. Aborting ... \n", gbit_depth);
+				dprintf(0, "\nReading Input Iteration: bit depth of %i is not supported yet. Aborting ... ", gbit_depth);
 				return 0;
 			}
 				// Images have to match
 			if(gH != H || gW != W || gnchannels != f_nchannels)
 			{
-				dprintf(0, "Input and Iteration images do not match.\n");
+				dprintf(0, "\nInput and Iteration images do not match.");
 				return 0;
 			}
 			
@@ -2017,11 +2141,11 @@ int main(int nargs, char** args){
 	}
 
 	// Max and min values of f
-	dprintf(0, "Calculating min(f) and max(f) values\n");
+	dprintf(0, "\nCalculating min(f) and max(f) values");
 	type f_max = Matrix::max_rgb_norm2<type>(host_input_f, H, W, f_valid_channels);
 	type f_min = Matrix::min_rgb_norm2<type>(host_input_f, H, W, f_valid_channels);
 	type f_range = sqrt(f_max) - sqrt(f_min);
-	dprintf(0,  "\tmin(f) = %f and max(f) = %f \n", f_min, f_max);
+	dprintf(0,  "\n\tmin(f) = %f and max(f) = %f ", f_min, f_max);
 
 	// ---------- Save txt slices for original function f also for comparisons ---------------------------------
 
@@ -2034,7 +2158,7 @@ int main(int nargs, char** args){
 	
 	if(h_slice_list.size() > 0)
 	{
-		printf("Saving H slices for input image f ... \n");
+		printf("\nSaving H slices for input image f ... ");
 		for(int index = 0; index < (int)h_slice_list.size(); index++)
 		{
 			int i = h_slice_list.at(index);
@@ -2050,7 +2174,7 @@ int main(int nargs, char** args){
 				fprintf(slice_file, "\n");
 			}
 			fclose(slice_file);
-			dprintf(0, "Input H slice %d saved in %s.\n", i, (slice_file_name ).data());						
+			dprintf(0, "\nInput H slice %d saved in %s.", i, (slice_file_name ).data());						
 		}
 	}
 	
@@ -2072,7 +2196,7 @@ int main(int nargs, char** args){
 				fprintf(slice_file, "\n");
 			}
 			fclose(slice_file);
-			dprintf(0, "Input V slice %d saved in %s.\n", j, (slice_file_name ).data());						
+			dprintf(0, "\nInput V slice %d saved in %s.", j, (slice_file_name ).data());						
 		}
 	}
 	printf("\n");
@@ -2080,17 +2204,17 @@ int main(int nargs, char** args){
 	
 	/* GPU info */
 	
-	if(debug) dprintf(0, "GPU INFORMATION\n");
-	if(debug) dprintf(0, "Getting available GPU memory ...\n");
+	if(debug) dprintf(0, "\nGPU INFORMATION");
+	if(debug) dprintf(0, "\nGetting available GPU memory ...");
 	size_t free;
 	size_t total;
 	cudaMemGetInfo(&free, &total);
 	
-	if (debug) printf("There are %lu bytes available of %lu\n", free, total);
+	if (debug) printf("\nThere are %lu bytes available of %lu", free, total);
 	long unsigned int needgpu = 4 * f_valid_channels * H * W* sizeof(type) +  H * W* sizeof(type);
-	if(debug) printf("allocating images memory in device, need at least %lu free bytes on GPU ... \n", needgpu);
+	if(debug) printf("\nallocating images memory in device, need at least %lu free bytes on GPU ... ", needgpu);
 	if(free < needgpu)
-		if(debug) printf("Not enough available memory on GPU. There can be errors.\n");
+		if(debug) printf("\nNot enough available memory on GPU. There can be errors.");
 
 	
 	// ******************************************************************************************************************************
@@ -2122,7 +2246,7 @@ int main(int nargs, char** args){
 		{
 			//Change first color channels
 			for(int ch = 0; ch < f_valid_channels; ch ++){
-				type val = (type)(host_f[ch * H * W + i]);				
+				type val = min(1.0, (type)(host_f[ch * H * W + i]));				
 				// Apply gamma
 				val = Matrix::apply_gamma(val);
 				*p = (unsigned char)(val * RGB_REF);
@@ -2138,7 +2262,6 @@ int main(int nargs, char** args){
 		// Save PNG image
 		dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
 		write_png(final_output_name, pixels, H, W, f_nchannels, 8, debug);
-		dprintf(0, "\n > %s saved.", final_output_name.data());
 		if(save_log)
 		{
 			fprintf(log_file, "\n > %s saved.", final_output_name.data());
@@ -2169,15 +2292,14 @@ int main(int nargs, char** args){
 				p++;
 			}
 		}
-		if(debug) dprintf(0, "done.\n");
+		if(debug) dprintf(0, "done.");
 
 		// Save PNG image
 		dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
 		write_png(final_output_name, pixels, H, W, f_nchannels, f_bit_depth, debug);
-		dprintf(0, "\n > %s saved.", final_output_name.data());
 		if(save_log)
 		{
-			fprintf(log_file, "\n > %s saved.", final_output_name.data());
+			fprintf(log_file, "\nt > %s", final_output_name.data());
 		}
 
 		return 1;
@@ -2205,7 +2327,6 @@ int main(int nargs, char** args){
 			std::string output_file_name = output_name +  "-LINEAR-" + get_im_format(output_format) ;
 			dprintf(0, "\nOUTPUT PNG in LINEAR space ...");
 			write_png(output_file_name , pixels, H, W, 1 , 8, debug);
-			dprintf(0, "\n\t > %s saved.\n", output_file_name.data());
 		}
 
 		if(print_gamma)
@@ -2217,7 +2338,6 @@ int main(int nargs, char** args){
 			}
 			dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
 			write_png(output_file_name , pixels, H, W, 1 , 8, debug);
-			dprintf(0, "\n\t > %s saved.\n", output_file_name.data());
 		}
 		
 		delete[] host_f_gray, host_input_f, pixels;
@@ -2227,7 +2347,7 @@ int main(int nargs, char** args){
 
 	if(conf == CONF_RGF || CONF_ARRGF || CONF_CONV)
 	{
-		dprintf(0, "%s", (std::string("Configuration: ") + get_conf_name(conf) + "\n").data()) ;
+		dprintf(0, "%s", (std::string("\nConfiguration: ") + get_conf_name(conf) ).data()) ;
 
 		//type *host_f_gray_log = NULL;
 
@@ -2295,7 +2415,7 @@ int main(int nargs, char** args){
 					p += nchannels;
 				}
 		}
-		if(debug) dprintf(0, "done.\n");
+		if(debug) dprintf(0, "\n\tdone.");
 
 		/* Allocate GPU arrays */
 		type *dev_f;
@@ -2349,11 +2469,11 @@ int main(int nargs, char** args){
 		// FILTERING LOOPS:
 
 		// Loop for scale values (scale)
-		if(debug) dprintf(0, "\nStarting SCALEloop \n");
+		if(debug) dprintf(0, "\nStarting SCALEloop");
 		for(int i = 0; i < (int)scaleValues.size(); i++)
 		{
 		
-			type scale = scaleValues.at(i);
+			scale = scaleValues.at(i);
 			if(debug) dprintf(0, "scale = %.2f\n", scale);
 
 			// Scale range
@@ -2383,8 +2503,8 @@ int main(int nargs, char** args){
 			switch(sker)
 			{
 				case 0:
-					sskh = ceil(gaussian_neigh * ss);
-					sskw = ceil(gaussian_neigh * ss);
+					sskh = ceil(gaussian_support * ss);
+					sskw = ceil(gaussian_support * ss);
 					break;
 				case 1:
 					sskh = ceil(ss);
@@ -2420,8 +2540,8 @@ int main(int nargs, char** args){
 			switch(regker)
 			{
 				case 0:
-					regkh = ceil(gaussian_neigh * sreg * ss);
-					regkw = ceil(gaussian_neigh * sreg * ss);
+					regkh = ceil(gaussian_support * sreg * ss);
+					regkw = ceil(gaussian_support * sreg * ss);
 					break;
 				case 1:
 					regkh = ceil(sreg);
@@ -2448,8 +2568,8 @@ int main(int nargs, char** args){
 			switch(lmreg_ker)
 			{
 				case 0:
-					lmreg_kh = ceil(gaussian_neigh * lmreg_s);
-					lmreg_kw = ceil(gaussian_neigh * lmreg_s);
+					lmreg_kh = ceil(gaussian_support * lmreg_s);
+					lmreg_kw = ceil(gaussian_support * lmreg_s);
 					break;
 				case 1:
 					lmreg_kh = ceil(lmreg_s);
@@ -2471,17 +2591,17 @@ int main(int nargs, char** args){
 			{
 				// exponential weights
 				case 1:
-					lkh = ceil(gaussian_neigh * sl);
-					lkw = ceil(gaussian_neigh * sl);
+					lkh = ceil(gaussian_support * sl);
+					lkw = ceil(gaussian_support * sl);
 					break;
 				// circle characteristic weights
 				case 0:
-					lkh = ceil(gaussian_neigh * sl);
-					lkw = ceil(gaussian_neigh * sl);
+					lkh = ceil(gaussian_support * sl);
+					lkw = ceil(gaussian_support * sl);
 					break;
 				default:
-					lkh = ceil(gaussian_neigh * sl);
-					lkw = ceil(gaussian_neigh * sl);
+					lkh = ceil(gaussian_support * sl);
+					lkw = ceil(gaussian_support * sl);
 					break;
 			}
 			if(debug) dprintf(0, "lweights region for gpu: lkh = %i, lkw = %i\n", lkh, lkw);
@@ -2508,13 +2628,13 @@ int main(int nargs, char** args){
 				}
 			}
 			
-		dprintf(0, "\n\n\tWorking for ss = %.2f, sr = %.2f, sreg = %.2f, scale = %.2f\n", ss, sr, sreg, scale);
-		if(save_log) fprintf(log_file, "\n\n\tWorking for ss = %.2f, sr = %.2f, scale = %.2f\n", ss, sr, scale);
+		dprintf(0, "\n\n\tWorking for ss = %.4f, sr = %.4f, sreg = %.4f, scale = %.4f", ss, sr, sreg, scale);
+		if(save_log) fprintf(log_file, "\n\n\tWorking for ss = %.4f, sr = %.4f, scale = %.4f", ss, sr, scale);
 		
 		//Initialize dev_g according to conf
 		if(debug) dprintf(0, "\nIntializing dev_g in device (copying from g_host)... ");
 		cudaMemcpy(dev_g, host_g, valid_channels * H * W * sizeof(type), cudaMemcpyHostToDevice);				
-		if(debug) dprintf(0, "done.");	
+		if(debug) dprintf(0, "\n\tdone.");	
 	
 		// Perform iterations
 		bool run = true;
@@ -2525,8 +2645,9 @@ int main(int nargs, char** args){
 		if(it_list.size() > 0)
 			nit = it_list.at(maxInVector(it_list));
 		// Check if we still want to run iterations
-		run = (calc_convergence) || (it < nit);
-		
+		run = (calc_convergence || (it < nit));
+		dprintf(0, "\nrun = %i", run);
+
 		// Run iterations
 		bool converged = false;
 		auto start = std::chrono::high_resolution_clock::now();
@@ -2552,12 +2673,12 @@ int main(int nargs, char** args){
 			if(adaptive && local_measure >= 0)
 			{
 				dprintf(0, "lm ");
-				if(save_log) fprintf(log_file, "a ");
+				if(save_log) fprintf(log_file, "lm ");
 				
 				// Calculate local measure values
 				switch(local_measure)
 				{
-					case 0:	// Max as local measure
+					case LM_MAX:	// Max as local measure
 					
 						for(int i = 0; i < valid_channels; i++)
 						{
@@ -2578,7 +2699,7 @@ int main(int nargs, char** args){
 						
 						break;
 			
-					case 1:	// Mean as local measure
+					case LM_MEAN:	// Mean as local measure
 					
 						for(int i = 0; i < valid_channels; i++)
 						{
@@ -2601,7 +2722,7 @@ int main(int nargs, char** args){
 					
 
 					
-					default: // 2 or default: Standard deviation as local measure
+					case LM_STDEV: // 2: Standard deviation as local measure
 					
 						for(int i = 0; i < valid_channels; i++)
 						{
@@ -2637,7 +2758,27 @@ int main(int nargs, char** args){
 						cudaDeviceSynchronize();
 						
 						break;
-					
+
+					default:	// Max as default
+
+						for(int i = 0; i < valid_channels; i++)
+						{
+							// stdv is calculated in 3d using euclidean metric in rgb space
+							//subs_kernel_rgb<type><<<ggridsize, gblocksize>>>(dev_f, dev_g, devtemp, valid_channels, H, W); -> dev_temp_i
+							subs_kernel<type><<<ggridsize, gblocksize>>>(dev_f + i * H * W, dev_g + i * H * W, dev_temp + i * H * W, H, W);
+							gpuErrChk( cudaPeekAtLastError() );
+							
+							// Calculate mean value for each channel. -> dev_temp2
+							//local_mean_kernel<type><<<ggridsize, gblocksize>>>(dev_temp + i * H * W, dev_temp2 + i * H * W, H, W, sl, lweights, lkh, lkw);
+							//gpuErrChk( cudaPeekAtLastError() );
+				
+						}
+						//centered_max_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_temp2, dev_stdev, H, W, valid_channels, sl, lweights, lkh, lkw);
+						max_dist_kernel<type><<<ggridsize, gblocksize>>>(dev_temp, dev_stdev, H, W, valid_channels, sl, lweights, lkh, lkw);
+						gpuErrChk( cudaPeekAtLastError() );						
+						cudaDeviceSynchronize();
+						
+						break;
 					
 				}
 				
@@ -2680,7 +2821,8 @@ int main(int nargs, char** args){
 			cudaDeviceSynchronize();
 			
 			// Joint Bilateral Filter
-			dprintf(0, "b\t");
+			dprintf(0, "jb ");
+			if(save_log) fprintf(log_file, "jb ");
 			for(int ch = 0; ch<valid_channels; ch++)
 			{	
 				type* devf = dev_f;
@@ -2695,7 +2837,10 @@ int main(int nargs, char** args){
 				}
 				else
 				{
-					trilateral_kernel_rgb<type><<<dim3((int)(W/blockBilW) + 1, (int)(H/blockBilH) + 1,1), dim3(blockBilW, blockBilH,1)>>>(devf + ch * H * W, dev_g, dev_temp + ch * H * W, valid_channels, H, W, domain_extension, ss, sr * f_range, sm, sker, rker, mker, sskh, sskw);
+					if(adapt_sr)
+						trilateral_kernel_rgb<type><<<dim3((int)(W/blockBilW) + 1, (int)(H/blockBilH) + 1,1), dim3(blockBilW, blockBilH,1)>>>(devf + ch * H * W, dev_g, dev_temp + ch * H * W, valid_channels, H, W, domain_extension, ss, sr * f_range, sm, sker, rker, mker, sskh, sskw);
+					else
+						trilateral_kernel_rgb<type><<<dim3((int)(W/blockBilW) + 1, (int)(H/blockBilH) + 1,1), dim3(blockBilW, blockBilH,1)>>>(devf + ch * H * W, dev_g, dev_temp + ch * H * W, valid_channels, H, W, domain_extension, ss, sr, sm, sker, rker, mker, sskh, sskw);
 				}
 				gpuErrChk( cudaPeekAtLastError() );		
 			}
@@ -2706,7 +2851,7 @@ int main(int nargs, char** args){
 			// If we want to check convergence or norm between iterations
 			if(calc_norms)
 			{
-				if(debug) dprintf(0, "Calculating norms for it %i\n", it);
+				if(debug) dprintf(0, "\nCalculating norms for it %i", it);
 				//for every norm in norm_vector we have to calculate to show info to user. Maybe we could optimize so many comparisons
 				for(int i = 0; i < (int)show_norm_list.size(); i++)
 				{
@@ -2756,7 +2901,7 @@ int main(int nargs, char** args){
 						
 					}
 					
-					dprintf(0, "  %s = %.8f", norm_string.data(), sqrt(norm_val));
+					dprintf(0, "\n\t%s = %.8f", norm_string.data(), sqrt(norm_val));
 					if(save_log) fprintf(log_file, "  %s = %.16f", norm_string.data(), sqrt(norm_val));
 					
 					if(show_conv_values.at(i) > 0)
@@ -2764,8 +2909,8 @@ int main(int nargs, char** args){
 						type eps = conv_eps_list.at(show_conv_values.at(i) -1 );
 						if( norm_val <= eps * eps * valid_channels)
 						{	
-							dprintf(0, "\n * Convergence at Iteration %i with %s = %.16f for eps = %.8f\n", it, norm_string.data(), sqrt(norm_val), eps);
-							if(save_log) fprintf(log_file, "\n * Convergence at Iteration %i with %s = %.16f for eps = %.16f\n", it, norm_string.data(), sqrt(norm_val), eps);
+							dprintf(0, "\n *** Convergence at Iteration %i with %s = %.16f for eps = %.8f\n", it, norm_string.data(), sqrt(norm_val), eps);
+							if(save_log) fprintf(log_file, "\n *** Convergence at Iteration %i with %s = %.16f for eps = %.16f\n", it, norm_string.data(), sqrt(norm_val), eps);
 							
 							if(print_alt_conv) print_it = true;
 							
@@ -2782,7 +2927,7 @@ int main(int nargs, char** args){
 				}
 				if(sumVector(conv_values) == 0)
 				{
-					dprintf(0,"converged = true\n");
+					dprintf(0,"\n\tconverged = true");
 					converged = true;
 					if( stop_showing_on_convergence == false) calc_norms = true;
 				}
@@ -2808,7 +2953,8 @@ int main(int nargs, char** args){
 			{
 				auto stop = std::chrono::high_resolution_clock::now();
 				auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-				dprintf(0,"\tExecution time:\t%ld microseconds\n", duration.count());	
+				dprintf(0,"\n\tExecution time:\t%ld microseconds", duration.count());	
+				if(save_log) fprintf(log_file, "\n\tExecution time:\t%ld microseconds", duration.count());
 				
 				// Copy back result of iteration to Host en host_temp
 				if (debug) dprintf(0, "\nGetting back result to host , valid_channels = %d... ", valid_channels);
@@ -2842,7 +2988,6 @@ int main(int nargs, char** args){
 					}
 					dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
 					write_png(final_output_file_name , pixels, H, W, valid_channels , 8, debug);
-					dprintf(0, "\n\t > %s saved.\n", final_output_file_name.data());
 
 					if(save_log)
 					{
@@ -2869,7 +3014,6 @@ int main(int nargs, char** args){
 					}
 					dprintf(0, "\nOUTPUT PNG with GAMMA correction ...");
 					write_png(final_output_file_name , pixels, H, W, valid_channels , 8, debug);
-					dprintf(0, "\n\t > %s saved.\n", final_output_file_name.data());
 
 					if(save_log)
 					{
@@ -2924,6 +3068,7 @@ int main(int nargs, char** args){
 						{
 							host_output[i] -= min_val;
 							host_output[i] *= 0.45;
+							host_output[i] = min(1.0, host_output[i]);
 						}
 						
 						dprintf(0, "\nPrinting TONE MAPPED PNG with GAMMA correction ...");
@@ -2971,27 +3116,17 @@ int main(int nargs, char** args){
 				if(adaptive && txt_local_measure)
 				{
 					dprintf(0, "\nSaving LOCAL MEASURE TXT ...");
-					std::string file_name = out_name + "-lmeasure.txt";				
+					std::string file_name = out_name + "-lmeasure_" + get_lm_name(local_measure);				
+					Util::printToTxt<type>(file_name, host_local_measure, H, W, 1);
 					
-					FILE *file = fopen(file_name.data(), "w");
-					for(int i = 0; i < H; i++)
-					{
-						for(int j = 0; j < W; j++)
-						{
-							fprintf(file, "%.8f\t", host_local_measure[i * W + j]);
-						}
-						fprintf(file, "\n");
-					}
-					fclose(file);
-					dprintf(0, "\n\t> %s saved.", file_name.data());
 				}
-				if(debug) dprintf(0, "done.\n");
+				if(debug) dprintf(0, "\ndone.");
 
 				// Print PNG LOCAL MEASURE with gamma correction
 				if(adaptive && print_local_measure_gamma)
 				{
 					dprintf(0, "\nPrinting LOCAL MEASURE with GAMMA correction ...");
-					std::string file_name = out_name + "-lm_gamma.png";
+					std::string file_name = out_name + "-lm_" + get_lm_name(local_measure) + "_gamma.png";
 					unsigned char* pixels = new unsigned char[H * W];
 					//unsigned char * pix = new unsigned char[H * W * nchannels];
 					unsigned char *p = pixels;
@@ -3009,13 +3144,12 @@ int main(int nargs, char** args){
 							*p = (unsigned char)(val * RGB_REF);
 							p++;
 					}
-					if(debug) dprintf(0, "done.\n");
+					if(debug) dprintf(0, "\ndone.");
 					
 					write_png(file_name, pixels, H, W, 1, 8, debug);
-					dprintf(0, "\n\t> %s saved.", file_name.data());
 					if(save_log)
 					{
-						fprintf(log_file, "\nLocal Measure with Gamma > %s saved.", file_name.data());
+						fprintf(log_file, "\n\t > %s", file_name.data());
 					}
 					delete[] pixels;
 				
@@ -3025,7 +3159,7 @@ int main(int nargs, char** args){
 				{
 					// Save PNG image
 					dprintf(0, "\nPrinting LOCAL MEASURE in LINEAR space ...");
-					std::string file_name = out_name + "-lm_linear.png";
+					std::string file_name = out_name + "-lm_" + get_lm_name(local_measure) + "_linear.png";
 					unsigned char* pixels = new unsigned char[H * W];
 					//unsigned char * pix = new unsigned char[H * W * nchannels];
 					unsigned char *p = pixels;
@@ -3038,11 +3172,10 @@ int main(int nargs, char** args){
 							*p = (unsigned char)(val * RGB_REF);
 							p++;
 					}
-					if(debug) dprintf(0, "done.\n");
+					if(debug) dprintf(0, "\ndone.");
 
 					
 					write_png(file_name, pixels, H, W, 1, 8, debug);
-					dprintf(0, "\n\t> %s saved.", file_name.data());
 					if(save_log)
 					{
 						fprintf(log_file, "\nLocal Measure Linear > %s saved.", file_name.data());
@@ -3080,12 +3213,11 @@ int main(int nargs, char** args){
 							p++;
 						}
 					}
-					if(debug) dprintf(0, "done.\n");
+					if(debug) dprintf(0, "\ndone.");
 
 					// Save PNG image
 					dprintf(0, "\nPrinting DIFF PNG with GAMMA correction ... \n");
 					write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
-					dprintf(0, "\n\t > %s saved.\n", file_name.data());
 					if(save_log)
 					{
 						fprintf(log_file, "\n\t > %s saved.\n", file_name.data());
@@ -3117,9 +3249,8 @@ int main(int nargs, char** args){
 					}
 
 					// Save PNG image
-					dprintf(0, "Printing DIFF PNG in LINEAR SPACE ...\n");
+					dprintf(0, "\nPrinting DIFF PNG in LINEAR SPACE ...");
 					write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
-					dprintf(0, "\n\t > %s", file_name.data());
 					
 					if(save_log)
 					{
@@ -3162,10 +3293,9 @@ int main(int nargs, char** args){
 					// Save PNG image
 					dprintf(0, "\nPrinting DIFF SINGLE image with GAMMA correction ...");
 					write_png(file_name, pixels, H, W, 1, 8, debug);
-					dprintf(0, "\n\t > %s saved.", file_name.data());
 					if(save_log)
 					{
-						fprintf(log_file, "\n\t > %s saved.\n", file_name.data());
+						fprintf(log_file, "\n\t > %s saved.", file_name.data());
 					}
 					delete[] pixels;
 				}
@@ -3191,15 +3321,14 @@ int main(int nargs, char** args){
 						*p = (unsigned char)(sum * RGB_REF);
 						p++;
 					}
-					if(debug) dprintf(0, "done.\n");
+					if(debug) dprintf(0, "\n\tdone.");
 
 					// Save PNG image
 					dprintf(0, "\nPrinting DIFF SINGLE image in LINEAR space ...");
 					write_png(file_name, pixels, H, W, 1, 8, debug);
-					dprintf(0, "\n%s saved.", file_name.data());
 					if(save_log)
 					{
-						fprintf(log_file, "%s saved.\n", file_name.data());
+						fprintf(log_file, "\n%s saved.", file_name.data());
 					}
 					delete[] pixels;
 				}	
@@ -3290,15 +3419,14 @@ int main(int nargs, char** args){
 								p++;
 							}
 						}
-						if(debug) dprintf(0, "done.\n");
+						if(debug) dprintf(0, "\n\tdone.");
 
 						// Save PNG image
-						dprintf(0, "\n Printing CONTRAST ENHANCEMENT PNG with GAMMA correction ...");
+						dprintf(0, "\nPrinting CONTRAST ENHANCEMENT PNG with GAMMA correction ...");
 						write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
-						dprintf(0, "\n > %s saved.", file_name.data());
 						if(save_log)
 						{
-							fprintf(log_file, "\n > %s saved.", file_name.data());
+							fprintf(log_file, "\n > %s", file_name.data());
 						}
 					}
 
@@ -3329,15 +3457,14 @@ int main(int nargs, char** args){
 								p++;
 							}
 						}
-						if(debug) dprintf(0, "done.\n");
+						if(debug) dprintf(0, "\n\tdone.");
 
 						// Save PNG image
-						dprintf(0, "\n Printing CONTRAST ENHANCEMENT PNG in LINEAR space ...");
+						dprintf(0, "\nPrinting CONTRAST ENHANCEMENT PNG in LINEAR space ...");
 						write_png(file_name, pixels, H, W, nchannels, bit_depth, debug);
-						dprintf(0, "\n > %s saved.", file_name.data());
 						if(save_log)
 						{
-							fprintf(log_file, "\n > %s saved.", file_name.data());
+							fprintf(log_file, "\n\t > %s", file_name.data());
 						}
 					}
 				}				
@@ -3358,23 +3485,23 @@ int main(int nargs, char** args){
 		}
 		}
 
-		if(debug) dprintf(0, "Cleaning memory in host ... ");
+		if(debug) dprintf(0, "\nCleaning memory in host ... ");
 		delete[] host_f;
 		delete[] host_g;
 		delete[] pixels;
 		delete[] gpixels;
 		delete[] host_temp;
 		delete[] host_local_measure;
-		if(debug) dprintf(0, "done.\n");
+		if(debug) dprintf(0, "\n\tdone.");
 		
-		if(debug) dprintf(0, "Cleaning memory in device ... ");
+		if(debug) dprintf(0, "\nCleaning memory in device ... ");
 		cudaFree(dev_f);
 		cudaFree(dev_g);
 		cudaFree(dev_g_last);
 		cudaFree(dev_stdev);
 		cudaFree(dev_temp);
 		cudaFree(dev_temp2);
-		if(debug) dprintf(0, "done\n");
+		if(debug) dprintf(0, "\n\tdone\n");
 	}
 	
 	if(save_log)

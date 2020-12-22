@@ -141,6 +141,17 @@ namespace Matrix
 		return input_data_format;
 	}
 
+	template<typename type> type clip_top(type *in, int lenght, type max_val)
+	{
+		for(int i = 0; i < lenght; i++)
+		{
+			if(in[i] > max_val)
+			{
+				in[i] = max_val;
+			}
+		}
+	}
+
 	template<typename type> int apply_gamma(type *in, type *out, int lenght)
 	{
 		for(int k = 0; k < lenght; k++)
@@ -625,6 +636,14 @@ void fprintfVector( FILE *file, std::vector<std::string> v)
 	for(int i = 0; i < (int)v.size(); i++)
 	{
 		fprintf(file, "%s ", v.at(i).data());
+	}
+}
+
+void dprintfVector( FILE *file, std::vector<std::string> v)
+{
+	for(int i = 0; i < (int)v.size(); i++)
+	{
+		dprintf(0, "%s ", v.at(i).data());
 	}
 }
 

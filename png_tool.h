@@ -125,6 +125,9 @@ bool write_png(const char* file_name, unsigned char *pixels, int height, int wid
     free(row_pointers);
 
     fclose(fp);
+
+    dprintf(0, "\n\t > %s", file_name);
+
     return true;
 }
 
@@ -180,16 +183,16 @@ bool read_png(const char* filename, unsigned char* &pixels, int &height, int &wi
         return false;
     }
 
-    if(debug) printf("create to data structures: png_struct and png_infop\n");
+    if(debug) printf("\ncreate to data structures: png_struct and png_infop");
     png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if(png == NULL){
-    	printf("Could not create png structure\n");
+    	printf("\nCould not create png structure");
         fclose(file);
         return false;
     }
     png_infop info = png_create_info_struct(png);
     if(info == NULL){
-    	printf("Could not create info structure\n");
+    	printf("\nCould not create info structure");
         png_destroy_read_struct(&png, NULL, NULL);
         fclose(file);
         return false;
@@ -197,7 +200,7 @@ bool read_png(const char* filename, unsigned char* &pixels, int &height, int &wi
 
     //printf("Set libpng error handling mechanism\n");
     if (setjmp(png_jmpbuf(png))){
-    	printf("Error\n");
+    	printf("\nError");
         png_destroy_read_struct(&png, &info, NULL);
         fclose(file);
         //require input pixels pointer to be null
@@ -219,7 +222,7 @@ bool read_png(const char* filename, unsigned char* &pixels, int &height, int &wi
 
     width = png_get_image_width(png, info);
     height = png_get_image_height(png, info);
-    if(debug) printf("height = %i, width = %i\n", height, width);
+    if(debug) printf("\nheight = %i, width = %i", height, width);
 
     //printf("set least one byte per channel\n");
     if(png_get_bit_depth(png, info)  < 8){
@@ -231,41 +234,41 @@ bool read_png(const char* filename, unsigned char* &pixels, int &height, int &wi
         png_set_tRNS_to_alpha(png);
     }
 
-    if(debug) printf("color type: ");
+    if(debug) printf("\ncolor type: ");
     color_type = png_get_color_type(png, info);
     switch(color_type){
     	case PNG_COLOR_TYPE_GRAY:
     		nchannels = 1;
-    		if(debug) printf("%u, PNG_COLOR_TYPE_GRAY\n", color_type);
+    		if(debug) printf("%u, PNG_COLOR_TYPE_GRAY", color_type);
     		break;
     	case PNG_COLOR_TYPE_GRAY_ALPHA:
     		nchannels = 2;
-    		if(debug) printf("%u, PNG_COLOR_TYPE_GRAY_ALPHA\n", color_type);
+    		if(debug) printf("%u, PNG_COLOR_TYPE_GRAY_ALPHA", color_type);
     		break;
     	case PNG_COLOR_TYPE_RGB:
     		nchannels = 3;
-    		if(debug) printf("%u, PNG_COLOR_TYPE_RGB\n", color_type);
+    		if(debug) printf("%u, PNG_COLOR_TYPE_RGB", color_type);
     		break;
     	case PNG_COLOR_TYPE_RGBA:
     		nchannels = 4;
-    		if(debug) printf("%u, PNG_COLOR_TYPE_RGBA\n", color_type);
+    		if(debug) printf("%u, PNG_COLOR_TYPE_RGBA", color_type);
     		break;
   		default:
-  			printf("png_tool: Not supported color type.\n");
+  			printf("\npng_tool: Not supported color type.");
   			return false;
     }
     
     bit_depth = png_get_bit_depth(png, info);
-    if(debug) printf("bit_depth = %i\n", bit_depth);
+    if(debug) printf("\nbit_depth = %i", bit_depth);
     
     unsigned char bytespp = (unsigned char)(png_get_rowbytes(png, info) / width);
-	if(debug) printf("bytespp = %i\n", bytespp);
+	if(debug) printf("\nbytespp = %i", bytespp);
 	
     png_set_interlace_handling(png);
 
     png_read_update_info(png, info);
 
-    if(debug) printf("allocate pixel buffer to save pixel values\n");
+    if(debug) printf("\nallocate pixel buffer to save pixel values\n");
     pixels = new unsigned char [height * width * nchannels];
     //printf("setup array with row pointers into pixel buffer\n");
     png_bytep rows[height];
@@ -275,18 +278,18 @@ bool read_png(const char* filename, unsigned char* &pixels, int &height, int &wi
         p += width * nchannels;
     }
 
-    if(debug) printf("read all rows (data goes into 'pixels' buffer)\n");
+    if(debug) printf("\nread all rows (data goes into 'pixels' buffer)");
     //note that all encoding error will jump into the setjmp pointers
     //and eventually become false
     png_read_image(png, rows);
 
-    if(debug) printf("read the end of the png file\n");
+    if(debug) printf("\nread the end of the png file");
     png_read_end(png, NULL);
-    if(debug) printf("finally, clean up and return true\n");
+    if(debug) printf("\nfinally, clean up and return true");
     png_destroy_read_struct(&png, &info, NULL);
-    if(debug) printf("close file\n");
+    if(debug) printf("\nclose file");
     fclose(file);
-    if(debug) printf("Reading image done.\n");
+    if(debug) printf("\nReading image done.");
     return true;
 }
 
