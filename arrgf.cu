@@ -270,6 +270,11 @@ int gbsZ = 1;
 int input_format = IMAGE_PNG;	// png image
 int output_format = IMAGE_PNG;
 
+int selected_channel = -1;
+bool selected_channel_ok = false;
+
+bool invert_image = false;
+
 bool print_alpha_channel = false;
 bool print_input_png = false;
 
@@ -666,6 +671,11 @@ int set_conf ()
 
 void make_output_name(std::string *out_name)
 {
+	// Add channel information if valid
+	if(selected_channel_ok)
+	{
+		*out_name += "-channel_" + Patch::to_string(selected_channel);
+	}
 	// Add adapt_sr info to RGF
 	if(adapt_sr && (conf == CONF_RGF || conf == CONF_RRGF))
 	{
@@ -801,6 +811,19 @@ int main(int nargs, char** args){
 			//printf("%s\n", input_name.data());
 		}
 
+		if(pname == "-input-channel" || pname == "-channel" || pname == "-use-channel")
+		{
+			if(argi < nargs)
+			{
+				selected_channel = atoi(args[argi]);
+				argi++;
+			}
+		}
+
+		if(pname == "-invert-input" || pname == "-invert"){
+			invert_image = true;
+		}
+
 		if(pname == "-output"|| pname == "-out")
 		{
 			//printf("Output: ");
@@ -909,22 +932,6 @@ int main(int nargs, char** args){
 			print_gamma = false;
 			print_linear = false;
 		}
-
-		// Gamma or linear input/output
-		/*if (pname.compare("-g") == 0|| pname.compare("-gamma") == 0 )
-		{
-			gammacor_in = true;
-			print_gamma = true;
-			print_linear = false;
-			gammacor_load_it = true;
-		}
-		if (pname.compare("-linear") == 0 || pname.compare("-no-gamma") == 0)
-		{
-			gammacor_in = false;
-			print_gamma = false;
-			print_linear = true;
-			gammacor_load_it = false;
-		}*/
 		if(pname == "-in-linear"|| pname == "-linear-in" || pname == "-linear-input"|| pname == "-input-linear" || pname == "-lin-in" || pname == "-in-lin")
 		{
 			gammacor_in = false;
@@ -1273,12 +1280,12 @@ int main(int nargs, char** args){
 				
 				std::string next_arg = std::string(args[argi]);
 				argi ++;
-				if(next_arg.compare("from-png") == 0 || next_arg.compare("from-image") == 0 || next_arg.compare("from-im") == 0)
+				if(next_arg == "from-png" || next_arg == "from-image" || next_arg == "from-im")
 				{
 					it_from_image_name = std::string(args[argi]);
 					argi++;
 				}
-				if(next_arg.compare("from-png-linear") == 0 || next_arg.compare("from-image-linear") == 0 || next_arg.compare("from-im-lin") == 0)
+				if(next_arg == "from-png-linear" || next_arg == "from-image-linear" || next_arg == "from-im-lin")
 				{
 					gammacor_load_it = false;
 					it_from_image_name = std::string(args[argi]);
@@ -2090,14 +2097,14 @@ int main(int nargs, char** args){
 			dprintf(0, "\nReading Input: bit depth of %i is not supported yet. Aborting ... ", f_bit_depth);
 			return 0;
 		}
-		printf("\nImage width: %i, Image height: %i, Number of channels: %i, valid channels: %i",H, W, f_nchannels, f_valid_channels);
+		dprintf(0,"\nImage width: %i, Image height: %i, Number of channels: %i, valid channels: %i",H, W, f_nchannels, f_valid_channels);
 
 		// Initialize host_f
-		host_input_f = new type[f_valid_channels * H * W];
+		host_input_f = new type[f_nchannels * H * W];
 		//HOST: Create arrays for each channel, alpha channel will not be filtered
 		// Will save host iterations as well as norms to show
 
-		for(int ch = 0; ch< f_valid_channels ; ch++){
+		for(int ch = 0; ch < f_nchannels ; ch++){
 			unsigned char *p = (pixels + ch);
 			//fill channel i for f
 			for(int i = 0; i< H*W; i++){
@@ -2113,10 +2120,17 @@ int main(int nargs, char** args){
 		valid_channels = f_valid_channels;
 		nchannels = f_nchannels;
 
-		// Ungamma input to have linear input
+		// Ungamma input to have linear input, only valid channels
 		if(gammacor_in)
 		{
 			Matrix::ungamma<type>(host_input_f, host_input_f, H * W * f_valid_channels);
+		}
+		if(invert_image)
+		{
+			for(int i = 0; i < H * W * f_nchannels; i++)
+			{
+				host_input_f[i] = 1 - host_input_f[i];
+			}
 		}
 
 		if(load_it)
@@ -2367,6 +2381,27 @@ int main(int nargs, char** args){
 				host_f_gray[i] = 0.2126*host_input_f[3 * i ] + 0.7152* host_input_f[3 * i + 1] + 0.0722*host_input_f[3*i + 2];
 			}*/
 			dprintf(0, "\n\tRGB to Gray calculated.");
+
+			host_f = host_f_gray;
+			
+		}
+
+		if( selected_channel > -1 && selected_channel < f_nchannels && !make_hdr_tone_mapping)
+		{
+			dprintf(0, "\nChannel %i will be the input for processing ", selected_channel);
+			selected_channel_ok = true;
+			type *host_f_gray = new type[H * W];
+			//host_f_gray_log = new type[H * W];
+
+			valid_channels = 1;
+			nchannels = 1;
+
+			for(int i = 0; i < H * W; i++)
+			{
+				host_f_gray[i] = host_input_f[selected_channel * H * W + i];
+				
+			}
+			dprintf(0, "\n\tChannel loaded");
 
 			host_f = host_f_gray;
 			
@@ -3486,13 +3521,13 @@ int main(int nargs, char** args){
 		}
 
 		if(debug) dprintf(0, "\nCleaning memory in host ... ");
+		delete[] host_input_f;
 		delete[] host_f;
 		delete[] host_g;
 		delete[] pixels;
 		delete[] gpixels;
 		delete[] host_temp;
 		delete[] host_local_measure;
-		if(debug) dprintf(0, "\n\tdone.");
 		
 		if(debug) dprintf(0, "\nCleaning memory in device ... ");
 		cudaFree(dev_f);
@@ -3501,7 +3536,6 @@ int main(int nargs, char** args){
 		cudaFree(dev_stdev);
 		cudaFree(dev_temp);
 		cudaFree(dev_temp2);
-		if(debug) dprintf(0, "\n\tdone\n");
 	}
 	
 	if(save_log)
